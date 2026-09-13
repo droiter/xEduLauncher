@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:gravity="center"
+    android:padding="32dp"
+    android:background="#FF11213A">
+
+    <TextView
+        android:id="@+id/lockIcon"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="⏰"
+        android:textSize="64sp" />
+
+    <TextView
+        android:id="@+id/lockTitle"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:text="今日使用时间已到"
+        android:textColor="#FFFFFFFF"
+        android:textSize="26sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:id="@+id/lockDesc"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:gravity="center"
+        android:text="请输入家长密码继续"
+        android:textColor="#FFB9C7DE"
+        android:textSize="15sp" />
+
+    <EditText
+        android:id="@+id/lockInput"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="28dp"
+        android:gravity="center"
+        android:hint="家长密码"
+        android:importantForAutofill="no"
+        android:inputType="numberPassword"
+        android:textColor="#FFFFFFFF"
+        android:textColorHint="#FF7C8CA6"
+        android:textSize="20sp" />
+
+    <Button
+        android:id="@+id/lockOk"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="20dp"
+        android:text="确认" />
+
+    <TextView
+        android:id="@+id/lockHint"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:gravity="center"
+        android:textColor="#FFFF7A7A"
+        android:textSize="14sp" />
+</LinearLayout>

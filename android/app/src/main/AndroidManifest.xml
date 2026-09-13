@@ -1,0 +1,93 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 列举已安装应用：用 <queries> 声明即可，无需 QUERY_ALL_PACKAGES 敏感权限 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.REORDER_TASKS" />
+
+    <application
+        android:label="儿童桌面"
+        android:name="${applicationName}"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false">
+
+        <!-- 桌面：同时声明 HOME 与 LAUNCHER，使其可被选为默认桌面。
+             刻意不加 excludeFromRecents——加了之后一按 Home 切走就从最近任务里消失，
+             家长想切回来只能重新找图标。 -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:stateNotNeeded="true"
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <meta-data
+                android:name="io.flutter.embedding.android.NormalTheme"
+                android:resource="@style/NormalTheme" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.HOME" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!-- 超时 / 超次数时强制弹出的密码锁屏 -->
+        <activity
+            android:name=".LockActivity"
+            android:exported="false"
+            android:launchMode="singleInstance"
+            android:excludeFromRecents="true"
+            android:taskAffinity=".lock"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:theme="@style/LockTheme" />
+
+        <!-- 计时守护前台服务 -->
+        <service
+            android:name=".GuardService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="parental_control_screen_time_watch" />
+        </service>
+
+        <!-- 开机自启：累计"开机/打开"次数 -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true"
+            android:enabled="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+        <meta-data
+            android:name="flutterEmbedding"
+            android:value="2" />
+    </application>
+
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.PROCESS_TEXT" />
+            <data android:mimeType="text/plain" />
+        </intent>
+        <!-- 仅供自检列出系统上现有的桌面 -->
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.HOME" />
+        </intent>
+    </queries>
+</manifest>
