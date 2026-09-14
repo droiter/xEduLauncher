@@ -2,14 +2,18 @@ package com.ccbridge.child_launcher
 
 import android.accessibilityservice.AccessibilityService
 import android.content.Context
+import android.content.Intent
 import android.os.SystemClock
 import android.view.accessibility.AccessibilityEvent
 import android.view.inputmethod.InputMethodManager
 
 /**
- * 前台守护：孩子按任务键（最近任务）切回一个已经在后台跑着的应用、或者从通知里点开应用时，
- * 那个应用会立刻出现在前台——这里盯的就是这一刻：只要它不是白名单里的应用，
- * 马上把桌面拉回来，孩子就没法借着「已经开着的应用」绕过管控。
+ * 前台守护，管两件事：
+ *
+ * 1. 非白名单应用露头（从通知点开、按任务键切回一个后台还在跑的应用）——立刻把桌面拉回来，
+ *    孩子就没法借着「已经开着的应用」绕过管控。
+ * 2. 「最近任务」那一屏——直接退掉，让孩子留在原来那个界面里。送回桌面等于换个方式逃出当前应用，
+ *    而且一按任务键就回桌面本身也不是家长要的（他要的是「拒绝，但不换界面」）。
  *
  * 只监听窗口切换事件（typeWindowStateChanged），不读取任何窗口内容，
  * 也不需要 canRetrieveWindowContent，系统设置页里给家长的说明就是这个用途。
@@ -27,6 +31,9 @@ class GuardAccessibilityService : AccessibilityService() {
         "com.google.android.permissioncontroller",
     )
 
+    /** 系统上除本应用之外的桌面，只查一次：手势导航下「最近任务」由默认桌面渲染 */
+    private var otherHomes: Set<String>? = null
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         Diag.log("guard", "前台守护服务已连接（无障碍）")
@@ -37,7 +44,10 @@ class GuardAccessibilityService : AccessibilityService() {
         if (e.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
         val pkg = e.packageName?.toString() ?: return
         val cls = e.className?.toString() ?: ""
-        if (pkg == packageName) return // 自己的桌面与密码页：不记、不拦
+
+        // 记下此刻最前面的是谁（包括自己的桌面）：桌面按 Home 要不要弹挑战框，就看这一行
+        Store.noteForeground(this, pkg)
+        if (pkg == packageName) return // 自己的桌面与密码页：不拦
 
         val ime = inputMethodPackages()
         val dialer = defaultDialer()
@@ -47,10 +57,45 @@ class GuardAccessibilityService : AccessibilityService() {
         val now = SystemClock.elapsedRealtime()
         if (now - lastBounceAt < 600L) return
         lastBounceAt = now
-        Diag.log("guard", "拦截 ${pkg}/${cls.substringAfterLast('.')} → 回到桌面")
+
+        if (isTaskSwitchScreen(pkg, cls)) {
+            Diag.log(
+                "guard",
+                "拦截任务键（$pkg/${cls.substringAfterLast('.')}）→ 退掉这一屏，留在当前任务",
+            )
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            return
+        }
+
+        Diag.log("guard", "拦截 $pkg/${cls.substringAfterLast('.')} → 回到桌面")
         // 这一下回桌面是本服务干的，不是孩子按的 Home：桌面那边记下来，别再弹挑战框
         Store.noteGuardBounce(this)
         performGlobalAction(GLOBAL_ACTION_HOME)
+    }
+
+    /**
+     * 这一屏是不是「最近任务」。两种来源都要认：SystemUI 自带的最近任务页（三键导航），
+     * 以及系统桌面——手势导航下多任务视图由默认桌面渲染，它一露头就说明孩子按了任务键。
+     */
+    private fun isTaskSwitchScreen(pkg: String, cls: String): Boolean {
+        val c = cls.lowercase()
+        if (c.contains("recents") || c.contains("overview")) return true
+        return pkg in otherHomeApps()
+    }
+
+    private fun otherHomeApps(): Set<String> {
+        otherHomes?.let { return it }
+        val s = try {
+            val home = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+            packageManager.queryIntentActivities(home, 0)
+                .map { it.activityInfo.packageName }
+                .filter { it != packageName }
+                .toSet()
+        } catch (_: Exception) {
+            emptySet()
+        }
+        otherHomes = s
+        return s
     }
 
     override fun onInterrupt() = Unit
@@ -61,6 +106,8 @@ class GuardAccessibilityService : AccessibilityService() {
      */
     private fun rememberForeign(pkg: String, ime: Set<String>, dialer: String?) {
         if (pkg in exempt || pkg in ime || pkg == dialer) return
+        // 桌面露头是「按了任务键」，不是孩子真在用哪个应用，别记成「他刚才在用的」
+        if (pkg in otherHomeApps()) return
         Store.noteForeign(this, pkg)
     }
 
@@ -68,7 +115,7 @@ class GuardAccessibilityService : AccessibilityService() {
         if (!Store.frontGuard(this)) return true
         if (Store.parentFreeActive(this)) return true // 家长拿着第二个密码去系统设置办事
         if (pkg in exempt) {
-            // 系统桌面在「最近任务」界面下就是任务键的宿主，这一屏必须拦掉；
+            // 系统桌面在「最近任务」界面下就是任务键的宿主，这一屏要拦（怎么拦见 isTaskSwitchScreen）；
             // 其余 SystemUI 窗口（下拉通知栏、音量条）放行，否则家长也用不了
             return !(pkg == "com.android.systemui" && cls.lowercase().contains("recents"))
         }

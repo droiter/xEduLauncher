@@ -37,6 +37,7 @@ object Store {
     private const val K_GUARD_ENABLED = "guard_enabled"
     private const val K_LAST_FOREIGN = "last_foreign_pkg"
     private const val K_BOUNCE_AT = "guard_bounce_at"
+    private const val K_CURRENT_FG = "current_foreground_pkg"
 
     const val DEFAULT_PASSWORD = "123456"
 
@@ -207,14 +208,25 @@ object Store {
         p(ctx).edit().putString(K_LAST_FOREIGN, "").apply()
     }
 
-    /** 前台守护刚用 GLOBAL_ACTION_HOME 把孩子弹回桌面（防任务键），记下时刻 */
+    /**
+     * 此刻出现在最前面的窗口属于哪个包（前台守护在窗口切换时记，包括本应用自己的桌面）。
+     * 两个用途：桌面按 Home 时判断「他本来就站在桌面上」；最近任务被拦下时知道该把他退回哪。
+     */
+    fun noteForeground(ctx: Context, pkg: String) {
+        p(ctx).edit().putString(K_CURRENT_FG, pkg).apply()
+    }
+
+    fun currentForeground(ctx: Context): String? =
+        p(ctx).getString(K_CURRENT_FG, "")?.takeIf { it.isNotBlank() }
+
+    /** 前台守护刚用 GLOBAL_ACTION_HOME 把孩子弹回桌面（防他打开非白名单应用），记下时刻 */
     fun noteGuardBounce(ctx: Context) {
         p(ctx).edit().putLong(K_BOUNCE_AT, SystemClock.elapsedRealtime()).apply()
     }
 
     /**
-     * 这次「回到桌面」是不是守护自己刚弹的。是的话别弹挑战框：孩子按的是任务键，
-     * 不是按 Home 逃回桌面，弹框只会让他按任务键也得先做一道题。
+     * 这次「回到桌面」是不是守护自己刚弹的。是的话别弹挑战框：孩子是打开了非白名单应用被拦回来的，
+     * 不是按 Home 逃回桌面，弹框只会让他白做一道题。
      */
     fun guardBounceRecent(ctx: Context): Boolean =
         SystemClock.elapsedRealtime() - p(ctx).getLong(K_BOUNCE_AT, 0L) < GUARD_BOUNCE_WINDOW_MS

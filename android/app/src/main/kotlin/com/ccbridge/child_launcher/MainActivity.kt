@@ -27,7 +27,7 @@ class MainActivity : FlutterActivity() {
 
     private var channel: MethodChannel? = null
 
-    /** 本次进程是否为「按 Home 键/开机进入桌面」而启动 */
+    /** 本进程是否为「按 Home 键/开机进入桌面」而冷启动（进程内 Activity 重建不算，见 onCreate） */
     private var launchedAsHome = false
 
     /** 本 Activity 此刻是否在前台。按 Home 时靠它区分「孩子从别的应用逃回桌面」和「本来就站在桌面上按的」 */
@@ -42,12 +42,21 @@ class MainActivity : FlutterActivity() {
     /** 上一次「默认桌面」尝试的结局，供自检报告引用 */
     private var lastHomeOutcome: String? = null
 
+    /** 上一次「回到桌面」的判定现场，供自检报告引用 */
+    private var lastHomeDecision: String? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
-        launchedAsHome = intent?.categories?.contains(Intent.CATEGORY_HOME) == true
+        // 只有本进程第一次创建 Activity 才算「按 Home 冷启动」。同一个进程里 Activity 被重建
+        // （ROM 重排桌面、系统回收后再拉起）时 intent 里照样带着 CATEGORY_HOME，孩子明明就站在
+        // 桌面上，却会被当成「刚从别的应用逃回来」——那就是误弹的挑战框。
+        val cold = !processStarted
+        processStarted = true
+        launchedAsHome = cold && intent?.categories?.contains(Intent.CATEGORY_HOME) == true
         Diag.log(
             "act",
             "onCreate action=${intent?.action ?: "-"} " +
-                "categories=${intent?.categories?.joinToString("|") ?: "-"} home=$launchedAsHome",
+                "categories=${intent?.categories?.joinToString("|") ?: "-"} " +
+                "冷启动=$cold home=$launchedAsHome",
         )
         super.onCreate(savedInstanceState)
     }
@@ -61,21 +70,35 @@ class MainActivity : FlutterActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        setIntent(intent)
         val isHome = intent.categories?.contains(Intent.CATEGORY_HOME) == true
+        // 特意不把带 CATEGORY_HOME 的 intent 存下来：存了之后 Activity 一旦被重建，
+        // onCreate 就会把那次重建误判成「按 Home 冷启动」，又给站在桌面上的孩子弹一道题
+        if (!isHome) setIntent(intent)
         // 已经在桌面上时按 Home，只是系统再叫一次桌面，不该拿挑战框去打扰孩子；
         // 只有这一下之前桌面在后台（孩子从别的应用逃回来）才弹，那才是这个开关要拦的。
-        // 守护自己弹回来的那次（孩子按的是任务键）也不算，拦回桌面就完事，别再加一道题
+        // 守护自己弹回来的那次（孩子开了非白名单应用）也不算，拦回桌面就完事，别再加一道题
+        val front = desktopInFront()
         val bounced = Store.guardBounceRecent(this)
-        val escape = isHome && !inForeground && !bounced
-        Diag.log(
-            "act",
-            "onNewIntent categories=${intent.categories?.joinToString("|") ?: "-"} " +
-                "home=$isHome 桌面已在前台=$inForeground 守护刚弹回=$bounced " +
-                "→ ${if (escape) "弹挑战" else "不打扰"}",
-        )
+        val escape = isHome && !front && !bounced
+        lastHomeDecision =
+            "onNewIntent home=$isHome 桌面已在前台=$front 守护刚弹回=$bounced " +
+                "→ ${if (escape) "弹挑战" else "不打扰"}"
+        Diag.log("act", "$lastHomeDecision （Activity=$inForeground 无障碍看到的当前前台=${fg() ?: "-"}）")
         if (escape) channel?.invokeMethod("onHomeKey", null)
     }
+
+    private fun fg(): String? = Store.currentForeground(this)
+
+    /**
+     * 「这一下回到桌面」之前，桌面是不是本来就在最前面——是就别弹挑战框。
+     * Activity 自己的前后台状态之外，再看一眼无障碍守护记下的「最前面那个窗口是谁」：
+     * 走冷启动路径、或 ROM 把桌面 Activity 重排重建时，前后台标志已经不可靠，这一路能兜住。
+     */
+    private fun desktopInFront(): Boolean = inForeground || desktopWasInFront()
+
+    /** 只认无障碍那一路：冷启动时 inForeground 一定是 true（刚 onResume 过），单靠它会把冷启动全放过 */
+    private fun desktopWasInFront(): Boolean =
+        Store.accessibilityOn(this) && Store.currentForeground(this) == packageName
 
     override fun onResume() {
         super.onResume()
@@ -183,10 +206,17 @@ class MainActivity : FlutterActivity() {
         when (method) {
             "config" -> {
                 val m = HashMap<String, Any>(Store.configMap(this))
-                // 冷启动也可能是守护弹回来的（进程被杀过），那种同样不弹挑战框
-                val coldHome = launchedAsHome && !Store.guardBounceRecent(this)
-                if (launchedAsHome && !coldHome) {
-                    Diag.log("home", "冷启动但刚被守护弹回，不弹挑战框")
+                // 冷启动也可能是守护弹回来的（进程被杀过），或者本来就是系统重排桌面——
+                // 孩子一直站在桌面上，这两种都不该弹挑战框
+                var coldHome = false
+                if (launchedAsHome) {
+                    val front = desktopWasInFront()
+                    val bounced = Store.guardBounceRecent(this)
+                    coldHome = !bounced && !front
+                    lastHomeDecision =
+                        "冷启动 桌面已在前台=$front 守护刚弹回=$bounced " +
+                            "→ ${if (coldHome) "弹挑战" else "不打扰"}"
+                    Diag.log("home", "$lastHomeDecision")
                 }
                 m["coldStartHome"] = coldHome
                 launchedAsHome = false
@@ -572,12 +602,14 @@ class MainActivity : FlutterActivity() {
         }
         sb.appendLine("上次「默认桌面」尝试：${lastHomeOutcome ?: "（本次运行还没点过）"}")
         sb.appendLine()
-        sb.appendLine("── 前台守护（防止孩子用任务键切回后台应用）──")
+        sb.appendLine("── 前台守护（拦非白名单应用 + 拒绝任务键）──")
         sb.appendLine("开关已打开：${Store.frontGuard(this)}")
         sb.appendLine("无障碍服务已在系统里启用：${Store.accessibilityOn(this)}")
         sb.appendLine("家长放行中（暂不拦截）：${Store.parentFreeActive(this)}")
         sb.appendLine("放行时长设置：${Store.settingsFreeMin(this)} 分钟")
-        sb.appendLine("被拦回桌面的都是非白名单应用，最近几次见下面日志里的 [guard] 行")
+        sb.appendLine("无障碍看到的当前前台：${fg() ?: "（还没记录）"}")
+        sb.appendLine("非白名单应用一露头就被送回桌面；「最近任务」那一屏直接退掉，孩子留在当前应用")
+        sb.appendLine("最近几次拦截见下面日志里的 [guard] 行")
         sb.appendLine()
         sb.appendLine("── 白名单（★ = 点开直接进，不弹挑战）──")
         val noCh = Store.noChallenge(this)
@@ -588,6 +620,7 @@ class MainActivity : FlutterActivity() {
         )
         sb.appendLine("挑战总开关：按 Home（从别的应用逃回来时）${Store.challengeOnHome(this)} / 启动应用 ${Store.challengeOnLaunch(this)}")
         sb.appendLine("按 Home 挑战没过会送回的应用：${Store.lastForeign(this) ?: "（还没记录）"}")
+        sb.appendLine("上一次「回到桌面」的判定：${lastHomeDecision ?: "（本次运行还没回到过桌面）"}")
         sb.appendLine()
         sb.appendLine("── 运行日志（共 ${Diag.size()} 条，从旧到新）──")
         sb.append(Diag.dump())
@@ -600,6 +633,9 @@ class MainActivity : FlutterActivity() {
     companion object {
         const val CHANNEL = "child_launcher/native"
         private const val REQ_HOME_ROLE = 201
+
+        /** 进程级：只有本进程第一次创建 Activity 才算「按 Home 冷启动」，之后重建都不算 */
+        private var processStarted = false
 
         /** 图标统一编码成这么大，够桌面磁贴用，又不至于把通道塞爆 */
         private const val ICON_PX = 128
