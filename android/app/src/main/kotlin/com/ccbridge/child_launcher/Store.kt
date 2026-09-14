@@ -17,11 +17,16 @@ object Store {
     const val FILE = "child_launcher_prefs"
 
     private const val K_PASSWORD = "password"
+    private const val K_SETTINGS_PASSWORD = "settings_password"
     private const val K_CHALLENGE_TYPE = "challenge_type" // none | mul | add | password
     private const val K_CH_ON_HOME = "challenge_on_home"
     private const val K_CH_ON_LAUNCH = "challenge_on_launch"
     private const val K_CH_ON_BACK = "challenge_on_back"
     private const val K_ALLOWED = "allowed_packages"
+    private const val K_NO_CHALLENGE = "no_challenge_packages"
+    private const val K_FRONT_GUARD = "front_guard_enabled"
+    private const val K_PARENT_FREE_UNTIL = "parent_free_until"
+    private const val K_SETTINGS_FREE_MIN = "settings_free_minutes"
     private const val K_DAILY_LIMIT_MIN = "daily_limit_minutes"
     private const val K_GRACE_MIN = "grace_minutes"
     private const val K_OPEN_LIMIT = "open_limit"
@@ -64,6 +69,15 @@ object Store {
     // ---------- 各项配置 ----------
 
     fun password(ctx: Context) = str(ctx, K_PASSWORD, DEFAULT_PASSWORD)
+
+    /** 未单独设置时沿用家长控制密码，家长不改也不会被关在系统设置外面 */
+    fun settingsPassword(ctx: Context): String {
+        val own = str(ctx, K_SETTINGS_PASSWORD, "")
+        return if (own.isBlank()) password(ctx) else own
+    }
+
+    fun hasOwnSettingsPassword(ctx: Context) = str(ctx, K_SETTINGS_PASSWORD, "").isNotBlank()
+
     fun challengeType(ctx: Context) = str(ctx, K_CHALLENGE_TYPE, "mul")
     fun challengeOnHome(ctx: Context) = bool(ctx, K_CH_ON_HOME, true)
     fun challengeOnLaunch(ctx: Context) = bool(ctx, K_CH_ON_LAUNCH, true)
@@ -72,6 +86,13 @@ object Store {
 
     fun allowed(ctx: Context): List<String> =
         (p(ctx).getStringSet(K_ALLOWED, emptySet()) ?: emptySet()).toList().sorted()
+
+    /** 白名单里「点开就进、不弹挑战」的那部分应用 */
+    fun noChallenge(ctx: Context): Set<String> =
+        p(ctx).getStringSet(K_NO_CHALLENGE, emptySet()) ?: emptySet()
+
+    fun frontGuard(ctx: Context) = bool(ctx, K_FRONT_GUARD, false)
+    fun settingsFreeMin(ctx: Context) = num(ctx, K_SETTINGS_FREE_MIN, 10)
 
     fun dailyLimitMin(ctx: Context) = num(ctx, K_DAILY_LIMIT_MIN, 0)
     fun graceMin(ctx: Context) = num(ctx, K_GRACE_MIN, 10)
@@ -166,6 +187,29 @@ object Store {
         }
     }
 
+    // ---------- 家长外出放行 ----------
+
+    /**
+     * 家长拿着第二个密码去系统设置里办事期间，前台守护必须让路，
+     * 否则刚打开设置页就会被弹回桌面。回到桌面（MainActivity.onResume）即收回。
+     * 同时留一个超时兜底：万一家长把手机停在设置页不管了，到点自动恢复管控。
+     */
+    fun grantParentFree(ctx: Context) {
+        val until = SystemClock.elapsedRealtime() + settingsFreeMin(ctx) * 60_000L
+        p(ctx).edit().putLong(K_PARENT_FREE_UNTIL, until).apply()
+        Diag.log("guard", "家长放行开始，${settingsFreeMin(ctx)} 分钟内不拦截前台应用")
+    }
+
+    fun clearParentFree(ctx: Context) {
+        if (p(ctx).getLong(K_PARENT_FREE_UNTIL, 0L) != 0L) {
+            p(ctx).edit().putLong(K_PARENT_FREE_UNTIL, 0L).apply()
+            Diag.log("guard", "家长放行结束")
+        }
+    }
+
+    fun parentFreeActive(ctx: Context): Boolean =
+        p(ctx).getLong(K_PARENT_FREE_UNTIL, 0L) > SystemClock.elapsedRealtime()
+
     // ---------- 系统能力 ----------
 
     fun isDefaultLauncher(ctx: Context): Boolean {
@@ -182,17 +226,29 @@ object Store {
     fun hasOverlay(ctx: Context): Boolean =
         if (Build.VERSION.SDK_INT >= 23) android.provider.Settings.canDrawOverlays(ctx) else true
 
+    /** 本应用的无障碍服务是否已在系统里被打开 */
+    fun accessibilityOn(ctx: Context): Boolean = try {
+        val am = ctx.getSystemService(Context.ACCESSIBILITY_SERVICE) as android.view.accessibility.AccessibilityManager
+        am.getEnabledAccessibilityServiceList(android.accessibilityservice.AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
+            .any { it.resolveInfo?.serviceInfo?.packageName == ctx.packageName }
+    } catch (_: Exception) {
+        false
+    }
+
     // ---------- 与 Dart 交换的配置快照 ----------
 
     fun configMap(ctx: Context): Map<String, Any> {
         rollDate(ctx)
         return mapOf(
             "password" to password(ctx),
+            "settingsPassword" to settingsPassword(ctx),
+            "settingsPwCustom" to hasOwnSettingsPassword(ctx),
             "challengeType" to challengeType(ctx),
             "chOnHome" to challengeOnHome(ctx),
             "chOnLaunch" to challengeOnLaunch(ctx),
             "chOnBack" to challengeOnBack(ctx),
             "allowed" to allowed(ctx),
+            "noChallenge" to noChallenge(ctx).sorted(),
             "dailyLimitMin" to dailyLimitMin(ctx),
             "graceMin" to graceMin(ctx),
             "openLimit" to openLimit(ctx),
@@ -202,6 +258,9 @@ object Store {
             "isDefaultLauncher" to isDefaultLauncher(ctx),
             "hasOverlay" to hasOverlay(ctx),
             "guardEnabled" to guardEnabled(ctx),
+            "frontGuard" to frontGuard(ctx),
+            "accessibilityOn" to accessibilityOn(ctx),
+            "settingsFreeMin" to settingsFreeMin(ctx),
         )
     }
 
@@ -209,15 +268,29 @@ object Store {
     fun applyConfig(ctx: Context, m: Map<String, Any?>) {
         val e = p(ctx).edit()
         (m["password"] as? String)?.let { if (it.isNotBlank()) e.putString(K_PASSWORD, it) }
+        (m["settingsPassword"] as? String)?.let {
+            // 空串 = 恢复成「沿用家长密码」
+            e.putString(K_SETTINGS_PASSWORD, it.trim())
+        }
         (m["challengeType"] as? String)?.let { e.putString(K_CHALLENGE_TYPE, it) }
         (m["chOnHome"] as? Boolean)?.let { e.putBoolean(K_CH_ON_HOME, it) }
         (m["chOnLaunch"] as? Boolean)?.let { e.putBoolean(K_CH_ON_LAUNCH, it) }
         (m["chOnBack"] as? Boolean)?.let { e.putBoolean(K_CH_ON_BACK, it) }
         (m["allowed"] as? List<String>)?.let { e.putStringSet(K_ALLOWED, it.toSet()) }
+        (m["noChallenge"] as? List<String>)?.let {
+            // 只保留还在白名单里的包，避免删掉应用后留下孤儿配置
+            val keep = (m["allowed"] as? List<String>)?.toSet()
+            e.putStringSet(
+                K_NO_CHALLENGE,
+                if (keep == null) it.toSet() else it.filter { p -> p in keep }.toSet(),
+            )
+        }
         (m["dailyLimitMin"] as? Number)?.let { e.putInt(K_DAILY_LIMIT_MIN, it.toInt()) }
         (m["graceMin"] as? Number)?.let { e.putInt(K_GRACE_MIN, it.toInt()) }
         (m["openLimit"] as? Number)?.let { e.putInt(K_OPEN_LIMIT, it.toInt()) }
         (m["guardEnabled"] as? Boolean)?.let { e.putBoolean(K_GUARD_ENABLED, it) }
+        (m["frontGuard"] as? Boolean)?.let { e.putBoolean(K_FRONT_GUARD, it) }
+        (m["settingsFreeMin"] as? Number)?.let { e.putInt(K_SETTINGS_FREE_MIN, it.toInt()) }
         e.apply()
     }
 }

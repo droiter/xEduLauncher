@@ -52,3 +52,6 @@ key.properties
 *.jks
 *.keystore
 /android/local.properties
+
+# 图标生成脚本的候选预览图，随用随生成
+/tools/out/

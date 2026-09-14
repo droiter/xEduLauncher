@@ -70,7 +70,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _launch(InstalledApp app) async {
     final cfg = _cfg!;
-    if (cfg.chOnLaunch && !await _runChallenge('准备打开「${app.label}」')) return;
+    // 家长在「应用白名单」里把这个应用设成免挑战时，直接打开
+    if (cfg.needsChallenge(app.package) &&
+        !await _runChallenge('准备打开「${app.label}」')) {
+      return;
+    }
     final ok = await Native.launchApp(app.package);
     if (!ok && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -93,7 +97,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _openSystemSettings() async {
-    final ok = await askParentPassword(context, title: '进入系统设置', subtitle: '请输入家长密码');
+    final cfg = _cfg;
+    final ok = await askParentPassword(
+      context,
+      title: '进入系统设置',
+      subtitle: cfg != null && cfg.settingsPwCustom
+          ? '请输入系统设置密码'
+          : '请输入家长密码（尚未单独设置系统设置密码）',
+      useSettingsPassword: true,
+    );
     if (!ok || !mounted) return;
     await Native.openSystemSettings();
     if (mounted) await _reload();

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 白房子 + 笑脸。整组缩到中间安全区（半径 33dp 的圆）内，圆形/方形遮罩都不会切到。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:scaleX="0.70"
+        android:scaleY="0.70"
+        android:translateX="16.2"
+        android:translateY="16.2">
+        <!-- 屋顶 -->
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M54,18.36 L15.12,51.84 L54,51.84 Z" />
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M54,18.36 L92.88,51.84 L54,51.84 Z" />
+        <!-- 房身 -->
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M33.48,46.44 L74.52,46.44 A7.56,7.56 0 0 1 82.08,54 L82.08,82.08 A7.56,7.56 0 0 1 74.52,89.64 L33.48,89.64 A7.56,7.56 0 0 1 25.92,82.08 L25.92,54 A7.56,7.56 0 0 1 33.48,46.44 Z" />
+        <!-- 笑脸 -->
+        <path
+            android:fillColor="#FF245CCD"
+            android:pathData="M40.5,63.18 A4.32,4.32 0 1 1 49.14,63.18 A4.32,4.32 0 1 1 40.5,63.18 Z" />
+        <path
+            android:fillColor="#FF245CCD"
+            android:pathData="M58.86,63.18 A4.32,4.32 0 1 1 67.5,63.18 A4.32,4.32 0 1 1 58.86,63.18 Z" />
+        <path
+            android:strokeColor="#FF245CCD"
+            android:strokeWidth="4.54"
+            android:strokeLineCap="round"
+            android:pathData="M64.76,70.47 A12.42,12.42 0 0 1 43.24,70.47" />
+    </group>
+</vector>

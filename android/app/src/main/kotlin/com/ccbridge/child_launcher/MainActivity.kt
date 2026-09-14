@@ -75,6 +75,8 @@ class MainActivity : FlutterActivity() {
             lastDefault = nowDefault
         }
         Store.onLauncherResume(this)
+        // 家长已经从系统设置那边回来了，前台守护立刻恢复管控
+        Store.clearParentFree(this)
         // 超时 / 超次数 → 拉起密码锁屏
         Store.gateReason(this)?.let {
             Diag.log("gate", "命中限制 $it，拉起密码页")
@@ -180,15 +182,27 @@ class MainActivity : FlutterActivity() {
                 result.success(launcherDiag())
             }
             "openSystemSettings" -> {
-                startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                leaveLauncherFor(
+                    Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                    "系统设置",
+                )
+                result.success(true)
+            }
+            "openAccessibilitySettings" -> {
+                leaveLauncherFor(
+                    Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                    "无障碍设置",
+                )
                 result.success(true)
             }
             "requestOverlay" -> {
-                startActivity(
+                leaveLauncherFor(
                     Intent(
                         Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
                         Uri.parse("package:$packageName")
-                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                    "悬浮窗权限页",
                 )
                 result.success(true)
             }
@@ -204,6 +218,7 @@ class MainActivity : FlutterActivity() {
                 result.success(true)
             }
             "verifyPassword" -> result.success(args == Store.password(this))
+            "verifySettingsPassword" -> result.success(args == Store.settingsPassword(this))
             "showLock" -> {
                 Store.showLock(this, args as? String ?: "time")
                 result.success(true)
@@ -219,6 +234,20 @@ class MainActivity : FlutterActivity() {
             }
             "defaultLauncherName" -> result.success(defaultLauncherLabel())
             else -> result.notImplemented()
+        }
+    }
+
+    /**
+     * 家长（输过第二个密码）要离开桌面去系统页办事：先给前台守护开一段放行时间，
+     * 否则刚打开设置页就会被无障碍服务弹回桌面。回到桌面时自动收回。
+     */
+    private fun leaveLauncherFor(intent: Intent, what: String) {
+        Store.grantParentFree(this)
+        Diag.log("act", "家长外出去$what，前台守护暂让路")
+        try {
+            startActivity(intent)
+        } catch (e: Exception) {
+            Diag.log("act", "打开$what 失败：${e.javaClass.simpleName}: ${e.message}")
         }
     }
 
@@ -319,6 +348,8 @@ class MainActivity : FlutterActivity() {
                     Diag.log("home", "角色弹框 intent 解析到：${who ?: "（没有任何 Activity 能处理）"}")
                     if (request != null && who != null) {
                         try {
+                            // 角色弹框由系统另一个包渲染，前台守护要放行，否则家长刚点就被弹回桌面
+                            Store.grantParentFree(this)
                             roleAskedAt = SystemClock.elapsedRealtime()
                             startActivityForResult(request, REQ_HOME_ROLE)
                             Diag.log("home", "已 startActivityForResult，等系统弹框（$who）")
@@ -351,6 +382,7 @@ class MainActivity : FlutterActivity() {
                 continue
             }
             try {
+                Store.grantParentFree(this)
                 startActivity(i)
                 Diag.log("home", "$label 已打开 $who")
                 return mapOf("code" to "settings", "detail" to "$label → $who")
@@ -436,6 +468,22 @@ class MainActivity : FlutterActivity() {
             sb.appendLine("API ${Build.VERSION.SDK_INT} < 29：系统不提供 ROLE_HOME")
         }
         sb.appendLine("上次「默认桌面」尝试：${lastHomeOutcome ?: "（本次运行还没点过）"}")
+        sb.appendLine()
+        sb.appendLine("── 前台守护（防止孩子用任务键切回后台应用）──")
+        sb.appendLine("开关已打开：${Store.frontGuard(this)}")
+        sb.appendLine("无障碍服务已在系统里启用：${Store.accessibilityOn(this)}")
+        sb.appendLine("家长放行中（暂不拦截）：${Store.parentFreeActive(this)}")
+        sb.appendLine("放行时长设置：${Store.settingsFreeMin(this)} 分钟")
+        sb.appendLine("被拦回桌面的都是非白名单应用，最近几次见下面日志里的 [guard] 行")
+        sb.appendLine()
+        sb.appendLine("── 白名单（★ = 点开直接进，不弹挑战）──")
+        val noCh = Store.noChallenge(this)
+        val allowedList = Store.allowed(this)
+        sb.appendLine(
+            if (allowedList.isEmpty()) "  （空，孩子只能看到家长设置）"
+            else allowedList.joinToString("\n") { p -> (if (p in noCh) "  ★ " else "  · ") + p }
+        )
+        sb.appendLine("挑战总开关：按 Home ${Store.challengeOnHome(this)} / 启动应用 ${Store.challengeOnLaunch(this)} / 返回键 ${Store.challengeOnBack(this)}")
         sb.appendLine()
         sb.appendLine("── 运行日志（共 ${Diag.size()} 条，从旧到新）──")
         sb.append(Diag.dump())

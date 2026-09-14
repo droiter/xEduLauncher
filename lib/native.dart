@@ -100,6 +100,10 @@ class Native {
   static Future<bool> verifyPassword(String pw) async =>
       await _ch.invokeMethod<bool>('verifyPassword', pw) ?? false;
 
+  /// 进系统设置专用的第二个密码（家长没单独设置时等于家长密码）
+  static Future<bool> verifySettingsPassword(String pw) async =>
+      await _ch.invokeMethod<bool>('verifySettingsPassword', pw) ?? false;
+
   /// 返回 role / already / settings / none，见 MainActivity.requestDefaultHome
   static Future<HomeSettingsResult> openHomeSettings() async {
     final m = await _ch.invokeMethod('openHomeSettings');
@@ -112,6 +116,10 @@ class Native {
 
 
   static Future<void> openSystemSettings() => _ch.invokeMethod('openSystemSettings');
+
+  /// 跳到系统「无障碍」页，让家长给前台守护授权
+  static Future<void> openAccessibilitySettings() =>
+      _ch.invokeMethod('openAccessibilitySettings');
   static Future<void> requestOverlay() => _ch.invokeMethod('requestOverlay');
   static Future<void> requestNotification() => _ch.invokeMethod('requestNotification');
   static Future<void> showLock(String reason) => _ch.invokeMethod('showLock', reason);

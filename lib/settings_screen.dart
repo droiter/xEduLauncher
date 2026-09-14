@@ -159,7 +159,8 @@ class _SettingsScreenState extends State<SettingsScreen>
                   onChanged: (v) => _patch({'chOnHome': v}),
                 ),
                 SwitchListTile(
-                  title: const Text('启动应用时挑战'),
+                  title: const Text('启动应用时挑战（总开关）'),
+                  subtitle: const Text('关掉则所有应用都直接打开；单独放行某个应用去白名单里设'),
                   value: cfg.chOnLaunch,
                   onChanged: (v) => _patch({'chOnLaunch': v}),
                 ),
@@ -217,10 +218,48 @@ class _SettingsScreenState extends State<SettingsScreen>
                   subtitle: Text(
                     cfg.allowed.isEmpty
                         ? '尚未添加，孩子只能看到「家长设置」'
-                        : '已允许 ${cfg.allowed.length} 个应用',
+                        : '已允许 ${cfg.allowed.length} 个应用'
+                              '${cfg.noChallenge.isEmpty ? '' : '，其中 ${cfg.noChallenge.length} 个打开时不弹挑战'}',
                   ),
                   trailing: const Icon(Icons.chevron_right),
                   onTap: _pickApps,
+                ),
+
+                _section('防绕过'),
+                SwitchListTile(
+                  title: const Text('前台守护（防任务键切换）'),
+                  subtitle: Text(
+                    !cfg.frontGuard
+                        ? '打开后，孩子按任务键切回后台的应用会被立刻送回桌面'
+                        : cfg.accessibilityOn
+                        ? '已生效：非白名单应用一露头就送回桌面'
+                        : '开关已打开，但系统「无障碍」里还没启用，去下面那一项打开',
+                  ),
+                  value: cfg.frontGuard,
+                  onChanged: _toggleFrontGuard,
+                ),
+                ListTile(
+                  title: const Text('无障碍权限'),
+                  subtitle: Text(
+                    cfg.accessibilityOn
+                        ? '已启用'
+                        : '未启用（前台守护必需，安卓只能靠它知道前台是哪个应用）',
+                  ),
+                  trailing: const Icon(Icons.open_in_new),
+                  onTap: () async {
+                    await Native.openAccessibilitySettings();
+                    await _load();
+                  },
+                ),
+                _sliderTile(
+                  title: '家长进系统设置时的放行时长',
+                  value: cfg.settingsFreeMin,
+                  min: 5,
+                  max: 60,
+                  divisions: 11,
+                  label: '${cfg.settingsFreeMin} 分钟',
+                  onPreview: (v) => _cfg!.settingsFreeMin = v,
+                  onCommit: (v) => _patch({'settingsFreeMin': v}),
                 ),
 
                 _section('权限与桌面'),
@@ -256,12 +295,22 @@ class _SettingsScreenState extends State<SettingsScreen>
                   onTap: () => Native.requestNotification(),
                 ),
 
-                _section('家长密码'),
+                _section('密码'),
                 ListTile(
-                  title: const Text('修改家长密码'),
-                  subtitle: const Text('默认密码 123456，请尽快修改'),
+                  title: const Text('修改家长控制密码'),
+                  subtitle: const Text('默认 123456，请尽快修改；进入家长设置、解锁超时都要用它'),
                   trailing: const Icon(Icons.chevron_right),
                   onTap: _changePassword,
+                ),
+                ListTile(
+                  title: const Text('修改系统设置密码'),
+                  subtitle: Text(
+                    cfg.settingsPwCustom
+                        ? '已单独设置，孩子拿不到这个密码就进不去系统设置'
+                        : '未单独设置，目前沿用家长控制密码',
+                  ),
+                  trailing: const Icon(Icons.chevron_right),
+                  onTap: _changeSettingsPassword,
                 ),
 
                 _section('今日统计'),
@@ -364,19 +413,81 @@ class _SettingsScreenState extends State<SettingsScreen>
 
   Future<void> _pickApps() async {
     final cfg = _cfg!;
-    final res = await Navigator.of(context).push<List<String>>(
-      MaterialPageRoute(builder: (_) => AppPickerScreen(selected: cfg.allowed)),
+    final res = await Navigator.of(context).push<AppPickerResult>(
+      MaterialPageRoute(
+        builder: (_) => AppPickerScreen(
+          selected: cfg.allowed,
+          noChallenge: cfg.noChallenge,
+        ),
+      ),
     );
-    if (res != null) await _patch({'allowed': res});
+    if (res == null) return;
+    // 两个字段一起提交：原生侧要靠 allowed 清掉已经被移除应用的免挑战配置
+    await _patch({'allowed': res.allowed, 'noChallenge': res.noChallenge});
+  }
+
+  Future<void> _toggleFrontGuard(bool v) async {
+    final cfg = _cfg!;
+    await _patch({'frontGuard': v});
+    if (!v) return;
+
+    if (!cfg.isDefaultLauncher) {
+      _toast('当前还不是默认桌面，前台守护要等设成默认桌面后才生效');
+    }
+    if (cfg.accessibilityOn || !mounted) return;
+
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('还需要打开「无障碍」'),
+        content: const Text(
+          '安卓上只有「无障碍」能让应用实时知道当前前台是哪个应用。\n\n'
+          '打开后：孩子按任务键（最近任务）切回一个后台跑着的应用，'
+          '比如之前打开过的系统设置，会被立刻送回儿童桌面。\n\n'
+          '接下来会跳到系统页面，请在列表里找到「儿童桌面」并打开它。\n'
+          '本应用只用它做这一件事，不读取屏幕内容、不联网。',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('稍后')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('去打开')),
+        ],
+      ),
+    );
+    if (go != true) return;
+    await Native.openAccessibilitySettings();
+    await _load();
   }
 
   Future<void> _changePassword() async {
+    final pw = await _askNewPassword(title: '修改家长控制密码');
+    if (pw == null) return;
+    await _patch({'password': pw});
+    _toast('家长控制密码已更新');
+  }
+
+  Future<void> _changeSettingsPassword() async {
+    final pw = await _askNewPassword(
+      title: '修改系统设置密码',
+      hint: '新密码（至少 4 位，留空则沿用家长控制密码）',
+      allowEmpty: true,
+    );
+    if (pw == null) return;
+    await _patch({'settingsPassword': pw});
+    _toast(pw.isEmpty ? '已改为沿用家长控制密码' : '系统设置密码已更新');
+  }
+
+  /// 两次输入的新密码框。返回 null = 取消或输入不合法；allowEmpty 时留空返回空串。
+  Future<String?> _askNewPassword({
+    required String title,
+    String hint = '新密码（至少 4 位）',
+    bool allowEmpty = false,
+  }) async {
     final ctrl = TextEditingController();
     final confirm = TextEditingController();
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('修改家长密码'),
+        title: Text(title),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -386,7 +497,7 @@ class _SettingsScreenState extends State<SettingsScreen>
               obscureText: true,
               keyboardType: TextInputType.number,
               inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-              decoration: const InputDecoration(labelText: '新密码（至少 4 位）'),
+              decoration: InputDecoration(labelText: hint),
             ),
             TextField(
               controller: confirm,
@@ -403,19 +514,23 @@ class _SettingsScreenState extends State<SettingsScreen>
         ],
       ),
     );
-    if (ok != true) return;
+    if (ok != true) return null;
 
     final pw = ctrl.text.trim();
+    if (pw.isEmpty) {
+      if (allowEmpty) return '';
+      _toast('密码至少 4 位');
+      return null;
+    }
     if (pw.length < 4) {
       _toast('密码至少 4 位');
-      return;
+      return null;
     }
     if (pw != confirm.text.trim()) {
       _toast('两次输入不一致');
-      return;
+      return null;
     }
-    await _patch({'password': pw});
-    _toast('密码已更新');
+    return pw;
   }
 
   void _toast(String s) {

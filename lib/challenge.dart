@@ -132,20 +132,30 @@ Future<bool> askParentPassword(
   BuildContext context, {
   required String title,
   String subtitle = '请输入家长密码',
+  bool useSettingsPassword = false,
 }) async {
   final ok = await showDialog<bool>(
     context: context,
     barrierDismissible: false,
-    builder: (_) => _PasswordDialog(title: title, subtitle: subtitle),
+    builder: (_) => _PasswordDialog(
+      title: title,
+      subtitle: subtitle,
+      useSettingsPassword: useSettingsPassword,
+    ),
   );
   return ok ?? false;
 }
 
 class _PasswordDialog extends StatefulWidget {
-  const _PasswordDialog({required this.title, required this.subtitle});
+  const _PasswordDialog({
+    required this.title,
+    required this.subtitle,
+    this.useSettingsPassword = false,
+  });
 
   final String title;
   final String subtitle;
+  final bool useSettingsPassword;
 
   @override
   State<_PasswordDialog> createState() => _PasswordDialogState();
@@ -164,7 +174,9 @@ class _PasswordDialogState extends State<_PasswordDialog> {
 
   Future<void> _submit() async {
     setState(() => _busy = true);
-    final ok = await Native.verifyPassword(_controller.text);
+    final ok = widget.useSettingsPassword
+        ? await Native.verifySettingsPassword(_controller.text)
+        : await Native.verifyPassword(_controller.text);
     if (!mounted) return;
     setState(() => _busy = false);
     if (ok) {

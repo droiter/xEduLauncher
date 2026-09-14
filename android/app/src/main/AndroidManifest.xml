@@ -58,6 +58,21 @@
                 android:value="parental_control_screen_time_watch" />
         </service>
 
+        <!-- 前台守护：孩子用任务键切回一个还在后台跑的应用时，把它送回桌面。
+             需要家长在「设置 → 无障碍」里手动打开，应用内提供一键跳转。 -->
+        <service
+            android:name=".GuardAccessibilityService"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/guard_accessibility" />
+        </service>
+
         <!-- 开机自启：累计"开机/打开"次数 -->
         <receiver
             android:name=".BootReceiver"
