@@ -5,6 +5,9 @@ import android.app.role.RoleManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.drawable.Drawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -15,6 +18,7 @@ import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -25,6 +29,9 @@ class MainActivity : FlutterActivity() {
 
     /** 本次进程是否为「按 Home 键/开机进入桌面」而启动 */
     private var launchedAsHome = false
+
+    /** 本 Activity 此刻是否在前台。按 Home 时靠它区分「孩子从别的应用逃回桌面」和「本来就站在桌面上按的」 */
+    private var inForeground = false
 
     /** 上一次观察到的默认桌面状态，只在变化时写日志，免得刷屏 */
     private var lastDefault: Boolean? = null
@@ -56,16 +63,23 @@ class MainActivity : FlutterActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         val isHome = intent.categories?.contains(Intent.CATEGORY_HOME) == true
+        // 已经在桌面上时按 Home，只是系统再叫一次桌面，不该拿挑战框去打扰孩子；
+        // 只有这一下之前桌面在后台（孩子从别的应用逃回来）才弹，那才是这个开关要拦的。
+        // 守护自己弹回来的那次（孩子按的是任务键）也不算，拦回桌面就完事，别再加一道题
+        val bounced = Store.guardBounceRecent(this)
+        val escape = isHome && !inForeground && !bounced
         Diag.log(
             "act",
-            "onNewIntent categories=${intent.categories?.joinToString("|") ?: "-"} home=$isHome",
+            "onNewIntent categories=${intent.categories?.joinToString("|") ?: "-"} " +
+                "home=$isHome 桌面已在前台=$inForeground 守护刚弹回=$bounced " +
+                "→ ${if (escape) "弹挑战" else "不打扰"}",
         )
-        // 按 Home 键回到桌面时，通知 Flutter 弹挑战框
-        if (isHome) channel?.invokeMethod("onHomeKey", null)
+        if (escape) channel?.invokeMethod("onHomeKey", null)
     }
 
     override fun onResume() {
         super.onResume()
+        inForeground = true
         val nowDefault = Store.isDefaultLauncher(this)
         if (nowDefault != lastDefault) {
             Diag.log(
@@ -82,6 +96,11 @@ class MainActivity : FlutterActivity() {
             Diag.log("gate", "命中限制 $it，拉起密码页")
             Store.showLock(this, it)
         }
+    }
+
+    override fun onPause() {
+        inForeground = false
+        super.onPause()
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -164,7 +183,12 @@ class MainActivity : FlutterActivity() {
         when (method) {
             "config" -> {
                 val m = HashMap<String, Any>(Store.configMap(this))
-                m["coldStartHome"] = launchedAsHome
+                // 冷启动也可能是守护弹回来的（进程被杀过），那种同样不弹挑战框
+                val coldHome = launchedAsHome && !Store.guardBounceRecent(this)
+                if (launchedAsHome && !coldHome) {
+                    Diag.log("home", "冷启动但刚被守护弹回，不弹挑战框")
+                }
+                m["coldStartHome"] = coldHome
                 launchedAsHome = false
                 result.success(m)
             }
@@ -175,7 +199,10 @@ class MainActivity : FlutterActivity() {
                 result.success(Store.configMap(this))
             }
             "listApps" -> result.success(listApps())
+            @Suppress("UNCHECKED_CAST")
+            "appIcons" -> result.success(appIcons(args as List<String>))
             "launchApp" -> result.success(launchApp(args as String))
+            "returnToLastApp" -> result.success(returnToLastApp())
             "openHomeSettings" -> result.success(requestDefaultHome())
             "launcherDiag" -> {
                 Diag.log("diag", "家长打开了桌面自检")
@@ -310,6 +337,82 @@ class MainActivity : FlutterActivity() {
         } catch (_: Exception) {
             false
         }
+    }
+
+    /**
+     * 按 Home 键的挑战没答对（答错后关掉、或按了取消）：把孩子送回他刚才在用的那个应用，
+     * 桌面得答对才进得去。「刚才在用哪个」由前台守护记着；记不到、或者那个应用已经不在白名单
+     * （送回去也会被守护立刻弹回来），就只能让他留在桌面。
+     */
+    private fun returnToLastApp(): Boolean {
+        val pkg = Store.lastForeign(this)
+        if (pkg == null) {
+            Diag.log("home", "挑战没过，但没有「刚才在用哪个应用」的记录，只能留在桌面")
+            return false
+        }
+        if (Store.frontGuard(this) && pkg !in Store.allowed(this)) {
+            Diag.log("home", "挑战没过，但 $pkg 已不在白名单，送回去也会被守护弹回来，留在桌面")
+            return false
+        }
+        val i = packageManager.getLaunchIntentForPackage(pkg)
+        if (i == null) {
+            Diag.log("home", "挑战没过，但 $pkg 没有启动入口（已卸载？），留在桌面")
+            return false
+        }
+        // 不带 RESET_TASK_IF_NEEDED：要的是把他放回原来那一屏，不是重启这个应用
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        return try {
+            startActivity(i)
+            Diag.log("home", "挑战没过，把孩子送回 $pkg")
+            true
+        } catch (e: Exception) {
+            Diag.log("home", "送回 $pkg 失败：${e.javaClass.simpleName}: ${e.message}")
+            false
+        }
+    }
+
+    // ---------- 应用图标 ----------
+
+    /** 编码好的图标按包名缓存；null = 这个包确实取不到图标，记住免得每次重问 */
+    private val iconCache = HashMap<String, ByteArray?>()
+
+    /**
+     * 一批包名的图标（PNG 字节），只处理没缓存过的。桌面每次回前台都要刷新一遍列表，
+     * 所以这里不跟着 [listApps] 一起给全部应用——Dart 侧只要白名单那几个，列表页要的时候才全要。
+     */
+    private fun appIcons(packages: List<String>): Map<String, ByteArray> {
+        if (packages.any { !iconCache.containsKey(it) }) {
+            val byPkg = HashMap<String, ResolveInfo>()
+            for (ri in query(launchableIntent(), 0)) {
+                byPkg.putIfAbsent(ri.activityInfo.packageName, ri)
+            }
+            for (pkg in packages) {
+                if (iconCache.containsKey(pkg)) continue
+                iconCache[pkg] = try {
+                    byPkg[pkg]?.let { encodePng(it.loadIcon(packageManager)) }
+                } catch (e: Exception) {
+                    Diag.log("icon", "取 $pkg 的图标失败：${e.javaClass.simpleName}: ${e.message}")
+                    null
+                }
+            }
+        }
+        val out = HashMap<String, ByteArray>()
+        for (pkg in packages) iconCache[pkg]?.let { out[pkg] = it }
+        return out
+    }
+
+    /**
+     * 把图标画进正方形位图再压成 PNG。自适应图标也走这条路：Drawable 自己按系统遮罩绘制，
+     * 缩到 [ICON_PX] 之后一张只剩几 KB，可以直接塞进 MethodChannel。
+     */
+    private fun encodePng(icon: Drawable): ByteArray {
+        val bmp = Bitmap.createBitmap(ICON_PX, ICON_PX, Bitmap.Config.ARGB_8888)
+        icon.setBounds(0, 0, ICON_PX, ICON_PX)
+        icon.draw(Canvas(bmp))
+        val out = ByteArrayOutputStream()
+        bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
+        bmp.recycle()
+        return out.toByteArray()
     }
 
     // ---------- 默认桌面 ----------
@@ -483,7 +586,8 @@ class MainActivity : FlutterActivity() {
             if (allowedList.isEmpty()) "  （空，孩子只能看到家长设置）"
             else allowedList.joinToString("\n") { p -> (if (p in noCh) "  ★ " else "  · ") + p }
         )
-        sb.appendLine("挑战总开关：按 Home ${Store.challengeOnHome(this)} / 启动应用 ${Store.challengeOnLaunch(this)} / 返回键 ${Store.challengeOnBack(this)}")
+        sb.appendLine("挑战总开关：按 Home（从别的应用逃回来时）${Store.challengeOnHome(this)} / 启动应用 ${Store.challengeOnLaunch(this)}")
+        sb.appendLine("按 Home 挑战没过会送回的应用：${Store.lastForeign(this) ?: "（还没记录）"}")
         sb.appendLine()
         sb.appendLine("── 运行日志（共 ${Diag.size()} 条，从旧到新）──")
         sb.append(Diag.dump())
@@ -496,5 +600,8 @@ class MainActivity : FlutterActivity() {
     companion object {
         const val CHANNEL = "child_launcher/native"
         private const val REQ_HOME_ROLE = 201
+
+        /** 图标统一编码成这么大，够桌面磁贴用，又不至于把通道塞爆 */
+        private const val ICON_PX = 128
     }
 }

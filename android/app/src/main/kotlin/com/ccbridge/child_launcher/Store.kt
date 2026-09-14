@@ -21,7 +21,6 @@ object Store {
     private const val K_CHALLENGE_TYPE = "challenge_type" // none | mul | add | password
     private const val K_CH_ON_HOME = "challenge_on_home"
     private const val K_CH_ON_LAUNCH = "challenge_on_launch"
-    private const val K_CH_ON_BACK = "challenge_on_back"
     private const val K_ALLOWED = "allowed_packages"
     private const val K_NO_CHALLENGE = "no_challenge_packages"
     private const val K_FRONT_GUARD = "front_guard_enabled"
@@ -36,11 +35,16 @@ object Store {
     private const val K_STAT_DATE = "stat_date"
     private const val K_LAST_RESUME = "last_resume"
     private const val K_GUARD_ENABLED = "guard_enabled"
+    private const val K_LAST_FOREIGN = "last_foreign_pkg"
+    private const val K_BOUNCE_AT = "guard_bounce_at"
 
     const val DEFAULT_PASSWORD = "123456"
 
     /** 距上次进入桌面超过该毫秒数，才把本次进入算作一次新的“打开” */
     private const val NEW_OPEN_GAP_MS = 120_000L
+
+    /** 守护弹回桌面后，这段时间内的「回到桌面」不再算孩子按的 Home */
+    private const val GUARD_BOUNCE_WINDOW_MS = 2_500L
 
     private fun p(ctx: Context) = ctx.getSharedPreferences(FILE, Context.MODE_PRIVATE)
 
@@ -81,7 +85,6 @@ object Store {
     fun challengeType(ctx: Context) = str(ctx, K_CHALLENGE_TYPE, "mul")
     fun challengeOnHome(ctx: Context) = bool(ctx, K_CH_ON_HOME, true)
     fun challengeOnLaunch(ctx: Context) = bool(ctx, K_CH_ON_LAUNCH, true)
-    fun challengeOnBack(ctx: Context) = bool(ctx, K_CH_ON_BACK, true)
     fun guardEnabled(ctx: Context) = bool(ctx, K_GUARD_ENABLED, false)
 
     fun allowed(ctx: Context): List<String> =
@@ -187,6 +190,35 @@ object Store {
         }
     }
 
+    // ---------- Home 键挑战的现场 ----------
+
+    /**
+     * 孩子此刻真正在用的应用（前台守护在窗口切换时记）。他在这个应用里按 Home 想回桌面、
+     * 挑战又没答对时，桌面把他送回这里——桌面要答对才进得去。开机时清掉，免得送进昨天的应用。
+     */
+    fun noteForeign(ctx: Context, pkg: String) {
+        p(ctx).edit().putString(K_LAST_FOREIGN, pkg).apply()
+    }
+
+    fun lastForeign(ctx: Context): String? =
+        p(ctx).getString(K_LAST_FOREIGN, "")?.takeIf { it.isNotBlank() }
+
+    fun clearLastForeign(ctx: Context) {
+        p(ctx).edit().putString(K_LAST_FOREIGN, "").apply()
+    }
+
+    /** 前台守护刚用 GLOBAL_ACTION_HOME 把孩子弹回桌面（防任务键），记下时刻 */
+    fun noteGuardBounce(ctx: Context) {
+        p(ctx).edit().putLong(K_BOUNCE_AT, SystemClock.elapsedRealtime()).apply()
+    }
+
+    /**
+     * 这次「回到桌面」是不是守护自己刚弹的。是的话别弹挑战框：孩子按的是任务键，
+     * 不是按 Home 逃回桌面，弹框只会让他按任务键也得先做一道题。
+     */
+    fun guardBounceRecent(ctx: Context): Boolean =
+        SystemClock.elapsedRealtime() - p(ctx).getLong(K_BOUNCE_AT, 0L) < GUARD_BOUNCE_WINDOW_MS
+
     // ---------- 家长外出放行 ----------
 
     /**
@@ -246,7 +278,6 @@ object Store {
             "challengeType" to challengeType(ctx),
             "chOnHome" to challengeOnHome(ctx),
             "chOnLaunch" to challengeOnLaunch(ctx),
-            "chOnBack" to challengeOnBack(ctx),
             "allowed" to allowed(ctx),
             "noChallenge" to noChallenge(ctx).sorted(),
             "dailyLimitMin" to dailyLimitMin(ctx),
@@ -275,7 +306,6 @@ object Store {
         (m["challengeType"] as? String)?.let { e.putString(K_CHALLENGE_TYPE, it) }
         (m["chOnHome"] as? Boolean)?.let { e.putBoolean(K_CH_ON_HOME, it) }
         (m["chOnLaunch"] as? Boolean)?.let { e.putBoolean(K_CH_ON_LAUNCH, it) }
-        (m["chOnBack"] as? Boolean)?.let { e.putBoolean(K_CH_ON_BACK, it) }
         (m["allowed"] as? List<String>)?.let { e.putStringSet(K_ALLOWED, it.toSet()) }
         (m["noChallenge"] as? List<String>)?.let {
             // 只保留还在白名单里的包，避免删掉应用后留下孤儿配置

@@ -10,7 +10,6 @@ class LauncherConfig {
   String challengeType; // none | mul | add | password
   bool chOnHome;
   bool chOnLaunch;
-  bool chOnBack;
   List<String> allowed;
 
   /// [allowed] 里「点开直接进、不弹挑战」的那部分
@@ -44,7 +43,6 @@ class LauncherConfig {
     this.challengeType = 'mul',
     this.chOnHome = true,
     this.chOnLaunch = true,
-    this.chOnBack = true,
     this.allowed = const [],
     this.noChallenge = const [],
     this.dailyLimitMin = 0,
@@ -69,7 +67,6 @@ class LauncherConfig {
     challengeType: m['challengeType'] as String? ?? 'mul',
     chOnHome: m['chOnHome'] as bool? ?? true,
     chOnLaunch: m['chOnLaunch'] as bool? ?? true,
-    chOnBack: m['chOnBack'] as bool? ?? true,
     allowed: (m['allowed'] as List?)?.cast<String>() ?? const [],
     noChallenge: (m['noChallenge'] as List?)?.cast<String>() ?? const [],
     dailyLimitMin: (m['dailyLimitMin'] as num?)?.toInt() ?? 0,

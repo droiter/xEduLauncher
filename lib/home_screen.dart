@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 
 import 'challenge.dart';
@@ -16,6 +18,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   LauncherConfig? _cfg;
   List<InstalledApp> _installed = const [];
 
+  /// 包名 → 图标 PNG 字节；取不到的包直接没有键，磁贴退回首字母
+  Map<String, Uint8List> _icons = const {};
+
   /// 同一时刻只允许一个挑战框
   bool _challenging = false;
 
@@ -24,11 +29,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     Native.homeKey.addListener(_onHomeKey);
-    _reload().then((_) {
+    _reload().then((_) async {
       final cfg = _cfg;
-      if (cfg != null && cfg.coldStartHome && cfg.chOnHome) {
-        _runChallenge('欢迎回来');
-      }
+      if (cfg == null || !cfg.coldStartHome || !cfg.chOnHome) return;
+      if (await _runChallenge('欢迎回来')) return;
+      await Native.returnToLastApp();
     });
   }
 
@@ -45,16 +50,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (state == AppLifecycleState.resumed) _reload();
   }
 
-  void _onHomeKey() {
-    if (_cfg?.chOnHome ?? false) _runChallenge('按 Home 键');
+  /// 原生侧只在「孩子从别的应用按 Home 逃回桌面」时通知这里（守护自己弹回桌面的那次不通知）。
+  /// 答对才留在桌面；答错或取消，把他送回刚才那个应用——桌面是答对才进得去的地方。
+  Future<void> _onHomeKey() async {
+    if (!(_cfg?.chOnHome ?? false) || _challenging) return;
+    if (await _runChallenge('按 Home 键')) return;
+    await Native.returnToLastApp();
   }
 
   Future<void> _reload() async {
     final results = await Future.wait([Native.config(), Native.listApps()]);
+    final cfg = results[0] as LauncherConfig;
+    // 图标跟列表一起就绪再上屏，免得磁贴先从字母闪成图标
+    final icons = await Native.appIcons(cfg.allowed);
     if (!mounted) return;
     setState(() {
-      _cfg = results[0] as LauncherConfig;
+      _cfg = cfg;
       _installed = results[1] as List<InstalledApp>;
+      _icons = icons;
     });
   }
 
@@ -81,10 +94,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         SnackBar(content: Text('无法打开 ${app.label}')),
       );
     }
-  }
-
-  Future<void> _onBackPressed() async {
-    if ((_cfg?.chOnBack ?? false)) await _runChallenge('返回键');
   }
 
   Future<void> _openSettings() async {
@@ -115,10 +124,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     final cfg = _cfg;
     return PopScope(
+      // 桌面上的返回键就此打住：孩子本来就站在桌面上，没什么可挑战的；
+      // 也绝不能放行——真让系统结束掉桌面 Activity，露出来的就是孩子上一个用的应用
       canPop: false,
-      onPopInvokedWithResult: (didPop, _) {
-        if (!didPop) _onBackPressed();
-      },
       child: Scaffold(
         body: SafeArea(
           child: cfg == null
@@ -181,7 +189,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         .toList();
 
     final tiles = <Widget>[
-      for (final a in allowed) _AppTile(app: a, onTap: () => _launch(a)),
+      for (final a in allowed)
+        _AppTile(app: a, icon: _icons[a.package], onTap: () => _launch(a)),
       _IconTile(
         icon: Icons.lock_outline,
         label: '家长设置',
@@ -252,36 +261,39 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 }
 
 class _AppTile extends StatelessWidget {
-  const _AppTile({required this.app, required this.onTap});
+  const _AppTile({required this.app, required this.icon, required this.onTap});
 
   final InstalledApp app;
+
+  /// 应用自己的图标（PNG 字节），原生侧没给出来时为 null
+  final Uint8List? icon;
+
   final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
-    final initial = app.label.isEmpty ? '?' : app.label.substring(0, 1);
+    final bytes = icon;
     return InkWell(
       onTap: onTap,
       borderRadius: BorderRadius.circular(18),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Container(
+          SizedBox(
             width: 68,
             height: 68,
-            decoration: BoxDecoration(
-              color: _colorFor(app.package),
-              borderRadius: BorderRadius.circular(18),
-            ),
-            alignment: Alignment.center,
-            child: Text(
-              initial,
-              style: const TextStyle(
-                fontSize: 30,
-                color: Colors.white,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
+            child: bytes == null
+                ? _letterTile()
+                : ClipRRect(
+                    borderRadius: BorderRadius.circular(16),
+                    child: Image.memory(
+                      bytes,
+                      width: 68,
+                      height: 68,
+                      fit: BoxFit.contain,
+                      gaplessPlayback: true,
+                    ),
+                  ),
           ),
           const SizedBox(height: 8),
           Text(
@@ -292,6 +304,26 @@ class _AppTile extends StatelessWidget {
             style: const TextStyle(fontSize: 13),
           ),
         ],
+      ),
+    );
+  }
+
+  /// 取不到图标时的兜底：色块 + 首字母
+  Widget _letterTile() {
+    final initial = app.label.isEmpty ? '?' : app.label.substring(0, 1);
+    return Container(
+      decoration: BoxDecoration(
+        color: _colorFor(app.package),
+        borderRadius: BorderRadius.circular(18),
+      ),
+      alignment: Alignment.center,
+      child: Text(
+        initial,
+        style: const TextStyle(
+          fontSize: 30,
+          color: Colors.white,
+          fontWeight: FontWeight.bold,
+        ),
       ),
     );
   }

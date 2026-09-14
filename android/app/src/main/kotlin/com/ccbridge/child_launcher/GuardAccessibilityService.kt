@@ -37,30 +37,44 @@ class GuardAccessibilityService : AccessibilityService() {
         if (e.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
         val pkg = e.packageName?.toString() ?: return
         val cls = e.className?.toString() ?: ""
-        if (allowed(pkg, cls)) return
+        if (pkg == packageName) return // 自己的桌面与密码页：不记、不拦
+
+        val ime = inputMethodPackages()
+        val dialer = defaultDialer()
+        rememberForeign(pkg, ime, dialer)
+        if (allowed(pkg, cls, ime, dialer)) return
 
         val now = SystemClock.elapsedRealtime()
         if (now - lastBounceAt < 600L) return
         lastBounceAt = now
         Diag.log("guard", "拦截 ${pkg}/${cls.substringAfterLast('.')} → 回到桌面")
+        // 这一下回桌面是本服务干的，不是孩子按的 Home：桌面那边记下来，别再弹挑战框
+        Store.noteGuardBounce(this)
         performGlobalAction(GLOBAL_ACTION_HOME)
     }
 
     override fun onInterrupt() = Unit
 
-    private fun allowed(pkg: String, cls: String): Boolean {
+    /**
+     * 记下孩子此刻在用的应用。他在这个应用里按 Home 想回桌面、挑战又没答对时，
+     * 桌面会把他送回这里。系统界面/输入法/电话不算「在用的应用」。
+     */
+    private fun rememberForeign(pkg: String, ime: Set<String>, dialer: String?) {
+        if (pkg in exempt || pkg in ime || pkg == dialer) return
+        Store.noteForeign(this, pkg)
+    }
+
+    private fun allowed(pkg: String, cls: String, ime: Set<String>, dialer: String?): Boolean {
         if (!Store.frontGuard(this)) return true
-        if (pkg == packageName) return true // 自己的桌面与密码页
         if (Store.parentFreeActive(this)) return true // 家长拿着第二个密码去系统设置办事
         if (pkg in exempt) {
             // 系统桌面在「最近任务」界面下就是任务键的宿主，这一屏必须拦掉；
             // 其余 SystemUI 窗口（下拉通知栏、音量条）放行，否则家长也用不了
             return !(pkg == "com.android.systemui" && cls.lowercase().contains("recents"))
         }
-        val ime = inputMethodPackages()
         if (pkg in ime) return true
         // 电话要放行：来电界面被弹回桌面，孩子就接不了电话了
-        if (pkg == defaultDialer()) return true
+        if (pkg == dialer) return true
         if (!Store.isDefaultLauncher(this)) return true // 还没被设为默认桌面，拦了就是死循环
         return pkg in Store.allowed(this)
     }

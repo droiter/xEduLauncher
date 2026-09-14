@@ -94,8 +94,33 @@ class Native {
     return raw.map((e) => InstalledApp.fromMap(e as Map)).toList();
   }
 
+  /// 图标字节按包名缓存。存的是同一批 Uint8List 实例，Image.memory 才会命中 Flutter 的
+  /// 图片缓存；每次重新下发一批新实例的话，桌面每次回前台都得把所有图标重新解一遍。
+  /// 值为 null 表示这个包确实取不到图标，问过一次就不再问。
+  static final Map<String, Uint8List?> _iconCache = {};
+
+  /// 取一批应用的图标（PNG 字节），拿不到的直接不在返回里
+  static Future<Map<String, Uint8List>> appIcons(List<String> packages) async {
+    final todo = packages.where((p) => !_iconCache.containsKey(p)).toList();
+    if (todo.isNotEmpty) {
+      final raw = await _ch.invokeMethod<Map<dynamic, dynamic>>('appIcons', todo) ?? {};
+      for (final p in todo) {
+        _iconCache[p] = raw[p] as Uint8List?;
+      }
+    }
+    return {
+      for (final p in packages)
+        if (_iconCache[p] != null) p: _iconCache[p]!,
+    };
+  }
+
   static Future<bool> launchApp(String package) async =>
       await _ch.invokeMethod<bool>('launchApp', package) ?? false;
+
+  /// 按 Home 键的挑战没答对：把孩子送回他刚才在用的那个应用（原生侧记着是哪个）。
+  /// 返回 false 表示没有可送回去的应用，孩子只能留在桌面。
+  static Future<bool> returnToLastApp() async =>
+      await _ch.invokeMethod<bool>('returnToLastApp') ?? false;
 
   static Future<bool> verifyPassword(String pw) async =>
       await _ch.invokeMethod<bool>('verifyPassword', pw) ?? false;

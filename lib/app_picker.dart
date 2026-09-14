@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 
 import 'native.dart';
@@ -27,6 +29,7 @@ class AppPickerScreen extends StatefulWidget {
 
 class _AppPickerScreenState extends State<AppPickerScreen> {
   List<InstalledApp>? _apps;
+  Map<String, Uint8List> _icons = const {};
   late Set<String> _picked;
   late Set<String> _free;
   String _query = '';
@@ -36,9 +39,19 @@ class _AppPickerScreenState extends State<AppPickerScreen> {
     super.initState();
     _picked = widget.selected.toSet();
     _free = widget.noChallenge.toSet();
-    Native.listApps().then((v) {
-      if (mounted) setState(() => _apps = v);
-    });
+    _load();
+  }
+
+  /// 列表先上屏，图标随后补——这台设备上一两百个应用的图标要转一会儿，
+  /// 没必要让家长对着转圈等
+  Future<void> _load() async {
+    final apps = await Native.listApps();
+    if (!mounted) return;
+    setState(() => _apps = apps);
+
+    final icons = await Native.appIcons(apps.map((a) => a.package).toList());
+    if (!mounted) return;
+    setState(() => _icons = icons);
   }
 
   void _toggle(String pkg, bool on) {
@@ -56,6 +69,25 @@ class _AppPickerScreenState extends State<AppPickerScreen> {
     final allowed = _picked.toList()..sort();
     final free = _free.where(_picked.contains).toList()..sort();
     Navigator.of(context).pop(AppPickerResult(allowed: allowed, noChallenge: free));
+  }
+
+  /// 应用自己的图标；还没拿到或取不到时留出同样宽度的空位，免得整列字左右跳
+  Widget _icon(String pkg) {
+    final bytes = _icons[pkg];
+    if (bytes == null) return const SizedBox(width: 44);
+    return Padding(
+      padding: const EdgeInsets.only(left: 4, right: 8),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(9),
+        child: Image.memory(
+          bytes,
+          width: 36,
+          height: 36,
+          fit: BoxFit.contain,
+          gaplessPlayback: true,
+        ),
+      ),
+    );
   }
 
   @override
@@ -97,9 +129,15 @@ class _AppPickerScreenState extends State<AppPickerScreen> {
                       final picked = _picked.contains(a.package);
                       final free = _free.contains(a.package);
                       return ListTile(
-                        leading: Checkbox(
-                          value: picked,
-                          onChanged: (v) => _toggle(a.package, v == true),
+                        leading: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Checkbox(
+                              value: picked,
+                              onChanged: (v) => _toggle(a.package, v == true),
+                            ),
+                            _icon(a.package),
+                          ],
                         ),
                         title: Text(a.label),
                         subtitle: Text(

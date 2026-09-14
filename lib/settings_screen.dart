@@ -155,6 +155,10 @@ class _SettingsScreenState extends State<SettingsScreen>
                 ),
                 SwitchListTile(
                   title: const Text('按 Home 键回到桌面时挑战'),
+                  subtitle: const Text(
+                    '只拦「从别的应用按 Home 逃回桌面」，孩子本来就站在桌面上时不打扰。\n'
+                    '答对才回到桌面；答错或取消，就把他送回刚才那个应用',
+                  ),
                   value: cfg.chOnHome,
                   onChanged: (v) => _patch({'chOnHome': v}),
                 ),
@@ -164,12 +168,6 @@ class _SettingsScreenState extends State<SettingsScreen>
                   value: cfg.chOnLaunch,
                   onChanged: (v) => _patch({'chOnLaunch': v}),
                 ),
-                SwitchListTile(
-                  title: const Text('按返回键时挑战'),
-                  value: cfg.chOnBack,
-                  onChanged: (v) => _patch({'chOnBack': v}),
-                ),
-
                 _section('使用限制'),
                 _sliderTile(
                   title: '每日使用时长上限',
@@ -230,9 +228,9 @@ class _SettingsScreenState extends State<SettingsScreen>
                   title: const Text('前台守护（防任务键切换）'),
                   subtitle: Text(
                     !cfg.frontGuard
-                        ? '打开后，孩子按任务键切回后台的应用会被立刻送回桌面'
+                        ? '打开后，孩子按任务键切回后台的应用会被立刻送回桌面，不弹挑战框'
                         : cfg.accessibilityOn
-                        ? '已生效：非白名单应用一露头就送回桌面'
+                        ? '已生效：非白名单应用一露头就送回桌面，任务键也不再弹挑战框'
                         : '开关已打开，但系统「无障碍」里还没启用，去下面那一项打开',
                   ),
                   value: cfg.frontGuard,

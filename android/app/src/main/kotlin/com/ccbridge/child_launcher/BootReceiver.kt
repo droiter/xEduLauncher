@@ -9,6 +9,8 @@ import androidx.core.content.ContextCompat
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(ctx: Context, intent: Intent) {
         Store.onBoot(ctx)
+        // 重启后没有「刚才在用的应用」，别让 Home 挑战没过时把孩子送进昨天的应用
+        Store.clearLastForeign(ctx)
         // Android 12+ 后台启动前台服务需要 SYSTEM_ALERT_WINDOW 之类的豁免，故先判权限
         if (Store.guardEnabled(ctx) && Store.hasOverlay(ctx)) {
             try {
