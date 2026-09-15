@@ -3,15 +3,24 @@ package com.ccbridge.child_launcher
 import android.accessibilityservice.AccessibilityService
 import android.content.Context
 import android.content.Intent
+import android.graphics.Color
+import android.graphics.PixelFormat
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
+import android.provider.Settings
+import android.util.TypedValue
+import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityWindowInfo
 import android.view.inputmethod.InputMethodManager
+import android.widget.TextView
 
 /**
- * 前台守护，管三件事：
+ * 前台守护，管这几件事：
  *
  * 1. 非白名单应用露头（从通知点开、按任务键切回一个后台还在跑的应用）——立刻把桌面拉回来，
  *    孩子就没法借着「已经开着的应用」绕过管控。
@@ -24,6 +33,8 @@ import android.view.inputmethod.InputMethodManager
  *    见 [beforeLauncher]。
  * 5. 系统「选文件」那一屏不是拦的对象，是放行的对象：孩子从白名单应用里点「选视频」必经
  *    DocumentsUI / 各家自带的文件管理器，弹回桌面等于把这个功能废掉。见 [pickerPackages]。
+ * 6. 屏幕顶部一行小字，实时显示这次还剩多久（见 [addOverlay]）。它同时是「这个服务还活着」的
+ *    指示灯：小字没了，就说明无障碍被系统关掉了，限时和前台守护都已经不生效。
  *
  * 只监听窗口切换事件（typeWindowStateChanged），不读取任何窗口内容，
  * 也不需要 canRetrieveWindowContent，系统设置页里给家长的说明就是这个用途。
@@ -57,6 +68,12 @@ class GuardAccessibilityService : AccessibilityService() {
     /** 上一个被放行的选择器包名：同一个包反复报窗口事件时日志只写一行 */
     private var lastPickerLogged: String? = null
 
+    /** 屏幕顶部那行「本次剩余 m:ss」，没加上时为 null */
+    private var overlay: TextView? = null
+
+    /** 浮层的结局，写进自检报告——加不上时家长能一眼看到为什么 */
+    private var overlayNote = "还没试过"
+
     /** 此刻最前面的窗口属于哪个包（每次窗口切换都更新） */
     private var frontPkg: String? = null
 
@@ -82,6 +99,7 @@ class GuardAccessibilityService : AccessibilityService() {
         // 家长过后来下载日志文件时看不到——而要看的问题恰恰都在这一段里
         Diag.attach(this)
         instance = this
+        addOverlay()
         Diag.log("guard", "前台守护服务已连接（无障碍）")
     }
 
@@ -89,14 +107,20 @@ class GuardAccessibilityService : AccessibilityService() {
         handler.removeCallbacks(sessionTick)
         sessionPkg = null
         challengeFor = null
+        removeOverlay()
         if (instance === this) instance = null
-        Diag.log("guard", "前台守护服务断开")
+        // 这条日志是「限时为什么又不生效」的答案所在：服务一没，单次计时、前台守护、
+        // 任务键拦截、回到桌面挑战全都跟着停，而桌面上看不出来
+        Diag.log("guard", "前台守护服务断开（限时/前台守护/任务键/回到桌面挑战随之全部失效）")
         super.onDestroy()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val e = event ?: return
         if (e.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+        // 屏幕顶部那行小字是本服务自己加的浮层。它每秒改一次文字，要是把自己的窗口事件当成
+        // 「孩子换了个应用」，单次计时会被自己打断，窗口链证据也会被它冲掉
+        if (isOwnOverlay(e.windowId)) return
         val pkg = e.packageName?.toString() ?: return
         val cls = e.className?.toString() ?: ""
 
@@ -367,6 +391,7 @@ class GuardAccessibilityService : AccessibilityService() {
         val limit = Store.singleUseMin(this)
         if (limit > 0) Diag.log("session", "$pkg 开始单次计时（上限 $limit 分钟）")
         arm()
+        updateOverlay()
     }
 
     private fun endSession(why: String) {
@@ -376,6 +401,7 @@ class GuardAccessibilityService : AccessibilityService() {
         sessionSeconds = 0
         handler.removeCallbacks(sessionTick)
         Diag.log("session", "$pkg 的单次计时结束（$why），本次已用 ${used}s")
+        updateOverlay()
     }
 
     /** 只在有会话、且家长没把上限设成「不限」时走表 */
@@ -409,6 +435,7 @@ class GuardAccessibilityService : AccessibilityService() {
         val pm = getSystemService(POWER_SERVICE) as PowerManager
         if (!pm.isInteractive) return true // 息屏不计时
         sessionSeconds++
+        updateOverlay()
         if (sessionSeconds >= Store.singleUseMin(this) * 60) {
             fireChallenge(pkg)
             return false
@@ -422,6 +449,7 @@ class GuardAccessibilityService : AccessibilityService() {
         challengeFor = pkg
         handler.removeCallbacks(sessionTick)
         Diag.log("session", "$pkg 连续用满 ${Store.singleUseMin(this)} 分钟 → 弹乘法挑战")
+        updateOverlay()
         Store.showSessionChallenge(this, pkg)
     }
 
@@ -439,6 +467,120 @@ class GuardAccessibilityService : AccessibilityService() {
             sessionSeconds = 0
             handler.removeCallbacks(sessionTick)
         }
+        updateOverlay()
+    }
+
+    // ---------- 屏幕顶部的剩余时间浮层 ----------
+
+    /**
+     * 孩子在白名单应用里时，屏幕顶部一行小字显示这次还剩多久，每秒跟着走。
+     *
+     * 用 TYPE_ACCESSIBILITY_OVERLAY——无障碍服务自己的浮层类型，不需要「显示在其他应用上层」
+     * 那个额外权限：这个功能本来就只在无障碍活着时才有意义，权限口径跟它对齐，少一个会静默
+     * 失效的开关。个别 ROM 不认这个类型，再退回 TYPE_APPLICATION_OVERLAY（那条要悬浮窗权限）。
+     */
+    private fun addOverlay() {
+        if (overlay != null) return
+        val tv = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setPadding(dp(12), dp(3), dp(12), dp(3))
+            setBackgroundColor(0xB3000000.toInt())
+            visibility = View.GONE
+            isClickable = false
+            isFocusable = false
+        }
+        val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        for (type in listOf(
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+        )) {
+            // 悬浮窗权限没给就别去撞那一下，省得日志里多一条没用的报错
+            if (type == WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY &&
+                !Settings.canDrawOverlays(this)
+            ) {
+                continue
+            }
+            val params = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                type,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                PixelFormat.TRANSLUCENT,
+            ).apply {
+                gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                // 压着状态栏那排图标不好看，往下让出状态栏的高度
+                y = statusBarHeight()
+            }
+            try {
+                wm.addView(tv, params)
+                overlay = tv
+                overlayNote = if (type == WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY) {
+                    "已显示（无障碍浮层，免权限）"
+                } else {
+                    "已显示（走悬浮窗权限那条路）"
+                }
+                Diag.log("session", "顶部剩余时间浮层：$overlayNote")
+                return
+            } catch (e: Exception) {
+                overlayNote = "${e.javaClass.simpleName}: ${e.message}"
+                Diag.log("session", "顶部浮层没加上（type=$type）：$overlayNote")
+            }
+        }
+        overlayNote = "加不上：$overlayNote"
+    }
+
+    private fun removeOverlay() {
+        val tv = overlay ?: return
+        overlay = null
+        try {
+            (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(tv)
+        } catch (_: Exception) {
+            // 已经跟着进程一起没了
+        }
+    }
+
+    /** 会话状态一变、以及走表每秒一次时刷一下 */
+    private fun updateOverlay() {
+        val tv = overlay ?: return
+        val text = overlayText()
+        if (text == null) {
+            if (tv.visibility != View.GONE) tv.visibility = View.GONE
+            return
+        }
+        if (tv.text.toString() != text) tv.text = text
+        if (tv.visibility != View.VISIBLE) tv.visibility = View.VISIBLE
+    }
+
+    /** 这行小字该显示什么；null = 不显示（没开单次上限 / 没在会话里 / 家长放行中 / 本应用的页面压在上面） */
+    private fun overlayText(): String? {
+        val limit = Store.singleUseMin(this)
+        if (limit <= 0) return null
+        if (sessionPkg == null) return null
+        if (challengeFor != null) return null // 挑战页弹着（或正要弹），表是停的
+        if (Store.parentFreeActive(this)) return null
+        if (LockActivity.showing || SessionChallengeActivity.showing || HttpConsentActivity.showing) {
+            return null
+        }
+        val left = (limit * 60 - sessionSeconds).coerceAtLeast(0)
+        return "本次剩余 ${left / 60}:${(left % 60).toString().padStart(2, '0')}"
+    }
+
+    /** 这个窗口 id 是不是本服务自己加的浮层 */
+    private fun isOwnOverlay(id: Int): Boolean = try {
+        windows.any { it.id == id && it.type == AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY }
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    private fun statusBarHeight(): Int {
+        val id = resources.getIdentifier("status_bar_height", "dimen", "android")
+        return if (id > 0) resources.getDimensionPixelSize(id) else dp(28)
     }
 
     companion object {
@@ -501,6 +643,8 @@ class GuardAccessibilityService : AccessibilityService() {
             val s = instance
             if (s == null) {
                 sb.appendLine("当前会话：无障碍服务没在运行，不会计时")
+                sb.appendLine("  → 去「家长设置 → 防绕过 → 无障碍权限」重新打开它，限时才可能生效")
+                sb.appendLine("屏幕顶部剩余时间小字：不会出现（它由无障碍服务显示）")
                 return sb.toString()
             }
             val pkg = s.sessionPkg
@@ -512,6 +656,10 @@ class GuardAccessibilityService : AccessibilityService() {
                 }
             )
             sb.appendLine("正在等答题：${s.challengeFor ?: "无"}")
+            sb.appendLine(
+                "屏幕顶部剩余时间小字：${s.overlayNote}；" +
+                    if (s.overlay == null) "现在没有" else "现在是「${s.overlay!!.text}」"
+            )
             sb.appendLine("无障碍看到的当前前台：${Store.currentForeground(ctx) ?: "（还没记录）"}")
             sb.appendLine("计时认的那个应用窗口：${s.frontAppPkg ?: "（还没记录）"}")
             return sb.toString()

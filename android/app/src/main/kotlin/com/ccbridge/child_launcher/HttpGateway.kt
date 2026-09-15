@@ -16,6 +16,8 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.URLDecoder
 import java.net.URLEncoder
+import java.nio.ByteBuffer
+import java.nio.charset.CodingErrorAction
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -300,9 +302,13 @@ object HttpGateway {
         sb.append("</div>")
 
         sb.append("<h3>上传</h3>")
-        sb.append("<form method=post action=\"/up?back=${urlEnc(rel)}\" enctype=\"multipart/form-data\" class=up>")
-        sb.append("<input type=file name=f multiple> ")
-        sb.append("<button type=submit>上传</button></form>")
+        sb.append("<form id=upform method=post action=\"/up?back=${urlEnc(rel)}\" enctype=\"multipart/form-data\" class=up>")
+        sb.append("<input id=upfile type=file name=f multiple> ")
+        sb.append("<button id=upbtn type=submit>上传</button>")
+        sb.append("<div id=upprog class=prog hidden><div class=track><i id=upfill></i></div>")
+        sb.append("<div class=\"mut\" id=uptext></div></div>")
+        sb.append(uploadScript())
+        sb.append("</form>")
         sb.append(
             "<p class=mut>上传的文件一律保存到设备的公共下载目录 <b>Download/</b>：" +
                 "放那里其他应用也看得到（播放器、孩子的教育应用都能直接选到）；" +
@@ -713,25 +719,58 @@ object HttpGateway {
         return true
     }
 
-    /** Content-Disposition 里的 filename（含 filename* 的 UTF-8 形式） */
+    /**
+     * Content-Disposition 里的 filename。先看 RFC 2231 的 filename*=（值带百分号编码，能直接 UTF-8 解），
+     * 没有就取普通的 filename=。两条路最后都要过一遍 [bytesToUtf8]。
+     */
     private fun filenameOf(cd: String): String? {
         val star = cd.indexOf("filename*=")
         if (star >= 0) {
-            var v = cd.substring(star + "filename*=".length).trim()
-            if (v.startsWith("\"")) v = v.trim('"')
+            var v = cd.substring(star + "filename*=".length).trim().substringBefore(';').trim()
+            if (v.startsWith("\"") && v.endsWith("\"") && v.length >= 2) v = v.substring(1, v.length - 1)
             val idx = v.indexOf("''")
             if (idx >= 0) v = v.substring(idx + 2)
-            return try {
+            val decoded = try {
                 URLDecoder.decode(v, "UTF-8")
             } catch (_: Exception) {
                 null
             }
+            if (decoded != null) return bytesToUtf8(decoded).ifBlank { null }
         }
         val plain = cd.indexOf("filename=")
         if (plain < 0) return null
         var v = cd.substring(plain + "filename=".length).trim().substringBefore(';').trim()
         if (v.startsWith("\"") && v.endsWith("\"") && v.length >= 2) v = v.substring(1, v.length - 1)
-        return v.ifBlank { null }
+        return bytesToUtf8(v).ifBlank { null }
+    }
+
+    /**
+     * 把「按字节读成字符」的字符串还原回真正的文字。
+     *
+     * HTTP 头是逐字节读进来的（后面紧跟二进制正文，绝不能用 Reader），于是每个字节都落成
+     * 一个 U+0000~U+00FF 的字符——UTF-8 的「中文.mp4」变成「ä¸æ–‡.mp4」。
+     * 浏览器在 multipart 头里写非 ASCII 文件名用的正是原始 UTF-8 字节，所以这里按 ISO-8859-1
+     * 还原成字节、再按 UTF-8 解一次。解不出来（名字本来就是 Latin-1，或者已经被
+     * filename*= 正确解过一遍）就原样返回，绝不把好名字改成「???」。
+     *
+     * owner 2026-09-15 反馈：上传中文名文件，落到 Download/ 里名字是乱码。
+     */
+    private fun bytesToUtf8(s: String): String {
+        if (s.all { it.code < 0x80 }) return s
+        val bytes = ByteArray(s.length)
+        for (i in s.indices) {
+            val c = s[i].code
+            if (c > 0xFF) return s // 已经是正常文字（码点超过单字节范围），不用再解
+            bytes[i] = c.toByte()
+        }
+        return try {
+            val dec = Charsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+            dec.decode(ByteBuffer.wrap(bytes)).toString()
+        } catch (_: Exception) {
+            s
+        }
     }
 
     /** 只取文件名本身，去掉路径和换行——上传上来的名字是不可信输入 */
@@ -904,7 +943,14 @@ object HttpGateway {
         .btn{background:#eef3ff;border-radius:8px;padding:6px 12px;font-size:13px;display:inline-block}
         .up{background:#fff;border-radius:12px;padding:16px;max-width:900px}
         button{background:#2b6cff;color:#fff;border:0;border-radius:8px;padding:9px 18px;font-size:14px;cursor:pointer}
+        button:disabled{background:#9db4e8;cursor:default}
         input[type=file]{font-size:14px;margin-right:8px}
+        .prog[hidden]{display:none}
+        .prog{margin-top:14px;max-width:520px}
+        .track{height:8px;background:#e6ecf7;border-radius:99px;overflow:hidden}
+        .track>i{display:block;height:100%;width:0;background:#2b6cff;border-radius:99px;transition:width .2s}
+        .prog.bad .track>i{background:#e03131}
+        .prog.bad .mut{color:#e03131}
         </style>
     """
 
@@ -913,6 +959,75 @@ object HttpGateway {
             "<title>$title</title>${css()}</head><body>"
 
     private fun foot(): String = "</body></html>"
+
+    /**
+     * 上传进度条。
+     *
+     * owner 2026-09-15 反馈：上传文件看不见进展，一个大视频传上去不知道是在走还是卡住了。
+     * 进度只有浏览器知道（服务端收完才回页面），所以把表单提交接管成 XHR，用 upload.onprogress
+     * 拿已发字节数画进度条。传完（100%）到服务端回页之间还有一段写盘时间，单独标出来，
+     * 免得家长以为卡在 100% 不动了。
+     *
+     * 没有 XHR/FormData 的老浏览器直接 return，退回原生表单提交——只是没有进度可看，功能照旧。
+     */
+    private fun uploadScript(): String = """
+<script>
+(function(){
+  var form=document.getElementById('upform');
+  if(!form || !window.XMLHttpRequest || !window.FormData) return;
+  var file=document.getElementById('upfile'), btn=document.getElementById('upbtn');
+  var box=document.getElementById('upprog'), fill=document.getElementById('upfill'), txt=document.getElementById('uptext');
+  function size(n){
+    if(n<1024) return n+' B';
+    if(n<1048576) return (n/1024).toFixed(1)+' KB';
+    if(n<1073741824) return (n/1048576).toFixed(1)+' MB';
+    return (n/1073741824).toFixed(2)+' GB';
+  }
+  function fail(msg){
+    box.className='prog bad';
+    txt.textContent=msg;
+    btn.disabled=false; file.disabled=false;
+  }
+  form.addEventListener('submit', function(ev){
+    if(!file.files || !file.files.length) return; // 没选文件就交给服务端回「没有收到文件」
+    ev.preventDefault();
+    var i, total=0, fd=new FormData();
+    for(i=0;i<file.files.length;i++){ fd.append('f', file.files[i]); total+=file.files[i].size; }
+    var xhr=new XMLHttpRequest();
+    xhr.open('POST', form.getAttribute('action'), true);
+    var last=Date.now(), lastBytes=0;
+    box.hidden=false; box.className='prog'; fill.style.width='0%';
+    txt.textContent='正在上传 0%  ·  0 B / '+size(total);
+    btn.disabled=true; btn.textContent='上传中…'; file.disabled=true;
+    xhr.upload.onprogress=function(e){
+      var tot=e.lengthComputable?e.total:total;
+      var pct=tot>0?Math.round(e.loaded*100/tot):0;
+      var speed='';
+      var now=Date.now();
+      if(now-last>400){
+        var bps=(e.loaded-lastBytes)*1000/(now-last);
+        if(bps>0) speed='  ·  '+size(bps)+'/s';
+        last=now; lastBytes=e.loaded;
+      }
+      fill.style.width=pct+'%';
+      txt.textContent=(pct>=100 ? '已传完，设备正在写入 Download/ …' : '正在上传 '+pct+'%')
+        +'  ·  '+size(e.loaded)+' / '+size(tot)+speed;
+    };
+    xhr.onload=function(){
+      if(xhr.status>=200 && xhr.status<400){
+        // 服务端回的是「上传完成」整页，直接顶掉当前页，省得再刷一次
+        document.open(); document.write(xhr.responseText); document.close();
+        return;
+      }
+      fail('上传失败（HTTP '+xhr.status+'），请重试。');
+    };
+    xhr.onerror=function(){ fail('上传失败：和设备断开了。看看设备上的「文件传输」是否还开着、两边是不是同一个 Wi-Fi。'); };
+    xhr.ontimeout=function(){ fail('上传超时，请重试。'); };
+    xhr.send(fd);
+  });
+})();
+</script>
+"""
 
     private fun waitPage(ip: String): String {
         val denied = deniedIp == ip
