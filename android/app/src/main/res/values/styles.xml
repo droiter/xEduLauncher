@@ -21,4 +21,13 @@
         <item name="android:windowFullscreen">true</item>
         <item name="android:colorAccent">#FF4C8DFF</item>
     </style>
+    <!-- 乘法挑战：窗口透明，孩子正用着的应用还露在四周，压暗层由布局自己画 -->
+    <style name="ChallengeTheme" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowAnimationStyle">@android:style/Animation.Dialog</item>
+        <item name="android:colorAccent">#FF4C8DFF</item>
+    </style>
 </resources>

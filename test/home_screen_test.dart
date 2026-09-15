@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -10,10 +11,14 @@ import 'package:child_launcher/native.dart';
 const _channel = MethodChannel('child_launcher/native');
 
 /// 每个用例用各自的应用包名：Native 里的图标缓存是静态的，同一个包名会串味
-Map<String, Object?> _config(String pkg, {bool coldStartHome = false}) => {
+Map<String, Object?> _config(
+  String pkg, {
+  bool coldStartHome = false,
+  bool chOnHome = true,
+}) => {
   'challengeType': 'mul',
   'chOnLaunch': true,
-  'chOnHome': true,
+  'chOnHome': chOnHome,
   'allowed': [pkg],
   'noChallenge': const <String>[],
   'dailyLimitMin': 0,
@@ -26,13 +31,16 @@ void _mock(
   Map<String, Uint8List> icons, {
   List<String>? calls,
   bool coldStartHome = false,
+  bool chOnHome = true,
+  Future<void>? configGate,
 }) {
   TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
       .setMockMethodCallHandler(_channel, (call) async {
         calls?.add(call.method);
         switch (call.method) {
           case 'config':
-            return _config(pkg, coldStartHome: coldStartHome);
+            if (configGate != null) await configGate;
+            return _config(pkg, coldStartHome: coldStartHome, chOnHome: chOnHome);
           case 'listApps':
             return [
               {'package': pkg, 'label': '计算器'},
@@ -49,6 +57,12 @@ void _mock(
 /// 原生侧通知「孩子从别的应用按 Home 逃回桌面」
 Future<void> _pressHome(WidgetTester tester) async {
   Native.homeKey.value++;
+  await tester.pumpAndSettle();
+}
+
+/// 原生侧通知「孩子从应用里一路按返回键退出来，落到了桌面」
+Future<void> _pressBackEscape(WidgetTester tester) async {
+  Native.backEscape.value++;
   await tester.pumpAndSettle();
 }
 
@@ -104,23 +118,18 @@ void main() {
     expect(find.text('计'), findsOneWidget);
   });
 
-  testWidgets('按 Home 键挑战取消：把孩子送回刚才那个应用', (tester) async {
-    final calls = <String>[];
-    _mock('com.home.cancel', const {}, calls: calls);
+  testWidgets('乘法挑战框没有取消按钮，只有确定', (tester) async {
+    _mock('com.home.nocancel', const {});
     await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
     await tester.pumpAndSettle();
 
     await _pressHome(tester);
     expect(find.textContaining('×'), findsOneWidget, reason: '该弹出乘法挑战框');
-
-    await tester.tap(find.text('取消'));
-    await tester.pumpAndSettle();
-
-    expect(find.byType(Dialog), findsNothing);
-    expect(calls, contains('returnToLastApp'));
+    expect(find.text('确定'), findsOneWidget);
+    expect(find.text('取消'), findsNothing, reason: '算术挑战不给退路');
   });
 
-  testWidgets('按 Home 键挑战答错：框留着重答，只有放弃才送回', (tester) async {
+  testWidgets('按 Home 键挑战答错：直接拒绝，把他送回刚才那个应用', (tester) async {
     final calls = <String>[];
     _mock('com.home.wrong', const {}, calls: calls);
     await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
@@ -132,12 +141,22 @@ void main() {
     await tester.tap(find.text('确定'));
     await tester.pumpAndSettle();
 
-    expect(find.text('答错了，再试一次'), findsOneWidget);
-    expect(calls, isNot(contains('returnToLastApp')), reason: '还能接着答，不该把人送走');
+    expect(find.byType(Dialog), findsNothing, reason: '答错就结束，没有第二次');
+    expect(calls, contains('returnToLastApp'), reason: '答错＝没通过，送回原来那个应用');
+  });
 
-    await tester.tap(find.text('取消'));
+  testWidgets('配置还没回来时按的 Home 也不能被放过', (tester) async {
+    final calls = <String>[];
+    final gate = Completer<void>();
+    _mock('com.home.early', const {}, calls: calls, configGate: gate.future);
+    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+
+    // initState 的首次 _reload 还卡在 config 上，此刻 _cfg 仍是 null
+    Native.homeKey.value++;
+    gate.complete();
     await tester.pumpAndSettle();
-    expect(calls, contains('returnToLastApp'));
+
+    expect(find.textContaining('×'), findsOneWidget, reason: '这一下 Home 不能被白白放过去');
   });
 
   testWidgets('按 Home 键挑战答对：留在桌面，不送回应用', (tester) async {
@@ -158,7 +177,36 @@ void main() {
     expect(calls, isNot(contains('returnToLastApp')));
   });
 
-  testWidgets('冷启动（进程被杀后按 Home）挑战取消：同样送回刚才那个应用', (tester) async {
+  testWidgets('在应用里按返回键退回桌面：也要弹挑战框，答错送回原应用', (tester) async {
+    final calls = <String>[];
+    _mock('com.back.escape', const {}, calls: calls);
+    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+    await tester.pumpAndSettle();
+
+    await _pressBackEscape(tester);
+    expect(find.textContaining('×'), findsOneWidget, reason: '按返回键退出应用也算逃回桌面');
+    expect(find.textContaining('按返回键'), findsOneWidget, reason: '要写清楚孩子是怎么出来的');
+
+    await tester.enterText(find.byType(TextField), '0');
+    await tester.tap(find.text('确定'));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(Dialog), findsNothing, reason: '答错就结束，没有第二次');
+    expect(calls, contains('returnToLastApp'), reason: '答错＝没通过，送回原来那个应用');
+  });
+
+  testWidgets('「从应用回到桌面时挑战」关掉后，按返回键退出来直接进桌面', (tester) async {
+    final calls = <String>[];
+    _mock('com.back.off', const {}, calls: calls, chOnHome: false);
+    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+    await tester.pumpAndSettle();
+
+    await _pressBackEscape(tester);
+    expect(find.byType(Dialog), findsNothing);
+    expect(calls, isNot(contains('returnToLastApp')));
+  });
+
+  testWidgets('冷启动（进程被杀后按 Home）答错：同样送回刚才那个应用', (tester) async {
     final calls = <String>[];
     _mock('com.home.cold', const {}, calls: calls, coldStartHome: true);
     await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
@@ -166,7 +214,8 @@ void main() {
 
     expect(find.textContaining('×'), findsOneWidget, reason: '冷启动该直接弹挑战框');
 
-    await tester.tap(find.text('取消'));
+    await tester.enterText(find.byType(TextField), '0');
+    await tester.tap(find.text('确定'));
     await tester.pumpAndSettle();
     expect(calls, contains('returnToLastApp'));
   });

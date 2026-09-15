@@ -29,9 +29,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     Native.homeKey.addListener(_onHomeKey);
+    Native.backEscape.addListener(_onBackEscape);
     _reload().then((_) async {
       final cfg = _cfg;
       if (cfg == null || !cfg.coldStartHome || !cfg.chOnHome) return;
+      // 冷启动这次是「从别处按 Home 把桌面拉起来」，判据在原生侧，这里只负责弹
+      Native.log('冷启动：原生判定为「从别处回到桌面」，弹挑战框');
       if (await _runChallenge('欢迎回来')) return;
       await Native.returnToLastApp();
     });
@@ -40,6 +43,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     Native.homeKey.removeListener(_onHomeKey);
+    Native.backEscape.removeListener(_onBackEscape);
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -50,11 +54,37 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (state == AppLifecycleState.resumed) _reload();
   }
 
-  /// 原生侧只在「孩子从别的应用按 Home 逃回桌面」时通知这里（守护自己弹回桌面的那次不通知）。
-  /// 答对才留在桌面；答错或取消，把他送回刚才那个应用——桌面是答对才进得去的地方。
-  Future<void> _onHomeKey() async {
-    if (!(_cfg?.chOnHome ?? false) || _challenging) return;
-    if (await _runChallenge('按 Home 键')) return;
+  /// 原生侧只在「孩子从别的应用逃回桌面」时通知这里（守护自己弹回桌面的那次不通知），
+  /// 按 Home 键和按返回键退出应用各走一个通知，弹框上要写清楚是哪一种。
+  Future<void> _onHomeKey() => _escapeFromApp('按 Home 键');
+
+  /// 在应用里按返回键一路退出来，落到了桌面上——和按 Home 一样算「从别处逃回来」
+  Future<void> _onBackEscape() => _escapeFromApp('按返回键回到桌面');
+
+  /// 孩子从别的应用逃回桌面：答对才留在桌面；答错或取消，把他送回刚才那个应用——
+  /// 桌面是答对才进得去的地方。
+  Future<void> _escapeFromApp(String title) async {
+    if (_challenging) {
+      Native.log('收到「$title」通知，但挑战框还开着，忽略这一下');
+      return;
+    }
+    var cfg = _cfg;
+    if (cfg == null) {
+      // 桌面 Activity 刚被重建，配置还没取回来。这一下不能被白白放过去——
+      // 等配置回来再判，否则孩子按一下键就直接进了桌面。
+      Native.log('收到「$title」通知，配置还没回来，先取配置再判');
+      await _reload();
+      cfg = _cfg;
+    }
+    if (cfg == null) {
+      Native.log('收到「$title」通知，配置仍取不回来，只能放过这一下');
+      return;
+    }
+    if (!cfg.chOnHome) {
+      Native.log('收到「$title」通知，但「回到桌面时挑战」开关是关的，直接进桌面');
+      return;
+    }
+    if (await _runChallenge(title)) return;
     await Native.returnToLastApp();
   }
 
@@ -75,8 +105,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final cfg = _cfg;
     if (cfg == null || _challenging) return false;
     _challenging = true;
-    final ok = await runChallenge(context, cfg, title);
-    _challenging = false;
+    var ok = false;
+    try {
+      ok = await runChallenge(context, cfg, title);
+    } catch (e) {
+      // 弹框这一下抛异常（桌面刚好被重建之类）也绝不能把 _challenging 卡在 true 上：
+      // 卡住之后孩子再按 Home 就完全没反应了，只能靠杀掉应用恢复
+      Native.log('挑战框「$title」弹失败：$e');
+      ok = false;
+    } finally {
+      _challenging = false;
+    }
+    Native.log('挑战框「$title」→ ${ok ? "通过" : "没通过"}');
     if (mounted) await _reload();
     return ok;
   }

@@ -27,10 +27,25 @@ class MainActivity : FlutterActivity() {
 
     private var channel: MethodChannel? = null
 
-    /** 本进程是否为「按 Home 键/开机进入桌面」而冷启动（进程内 Activity 重建不算，见 onCreate） */
-    private var launchedAsHome = false
+    /**
+     * 本 Activity 是被「按 Home / 开机」的 intent 拉起来时的判定结果（是否要弹挑战框，以及依据）。
+     * 判定必须趁 onCreate 做——那时 Activity 还没进前台，看到的正是「这一下之前」的现场；
+     * Dart 稍后才来调 config 取走它（见 dispatch "config"）。
+     */
+    private var pendingHome: Pair<Boolean, String>? = null
 
-    /** 本 Activity 此刻是否在前台。按 Home 时靠它区分「孩子从别的应用逃回桌面」和「本来就站在桌面上按的」 */
+    /**
+     * 桌面这一次「露面」是否已经判过（见 [judgeAppearance]）。露面 = 桌面重新出现在最前面，
+     * 包括从应用里按返回键退出来（系统连 intent 都不发，只有 onResume 这条路能看见）。
+     * 判过就不再判：孩子站在桌面上按 Home、系统把桌面重新拉起来时，不该把上一次用过的应用
+     * 翻出来再弹一道题（1.0.10 真机反馈：按返回键回到桌面后，再按 Home 又弹一次对话框）。
+     */
+    private var appearanceJudged = false
+
+    /** 这一次露面是不是「按 Home 键」造成的（onNewIntent 记下，onResume 用掉） */
+    private var viaHomeIntent = false
+
+    /** 本 Activity 此刻是否在前台。只作为判定的兜底依据之一 */
     private var inForeground = false
 
     /** 上一次观察到的默认桌面状态，只在变化时写日志，免得刷屏 */
@@ -46,19 +61,22 @@ class MainActivity : FlutterActivity() {
     private var lastHomeDecision: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        // 只有本进程第一次创建 Activity 才算「按 Home 冷启动」。同一个进程里 Activity 被重建
-        // （ROM 重排桌面、系统回收后再拉起）时 intent 里照样带着 CATEGORY_HOME，孩子明明就站在
-        // 桌面上，却会被当成「刚从别的应用逃回来」——那就是误弹的挑战框。
-        val cold = !processStarted
-        processStarted = true
-        launchedAsHome = cold && intent?.categories?.contains(Intent.CATEGORY_HOME) == true
+        super.onCreate(savedInstanceState)
+        Diag.attach(this)
+        // Activity 被 ROM 重建、或进程被杀后按 Home 冷启动，intent 里都带着 CATEGORY_HOME。
+        // 这两种都可能是「孩子本来就站在桌面上」，也可能是「他从别的应用按 Home 逃回来」，
+        // 所以照常判一次（判据见 judgeAppearance），结果留给 Dart 的 config 取走。
+        val fromHome = intent?.categories?.contains(Intent.CATEGORY_HOME) == true
+        viaHomeIntent = fromHome
+        // 这一次露面由这里一并判掉：紧接着的 onResume 不再重判（同一个现场判两次会弹两个框）
+        appearanceJudged = true
+        pendingHome = if (fromHome) judgeAppearance() else null
         Diag.log(
             "act",
             "onCreate action=${intent?.action ?: "-"} " +
                 "categories=${intent?.categories?.joinToString("|") ?: "-"} " +
-                "冷启动=$cold home=$launchedAsHome",
+                "home=$fromHome 判定=${pendingHome?.second ?: "-"}",
         )
-        super.onCreate(savedInstanceState)
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -71,38 +89,119 @@ class MainActivity : FlutterActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         val isHome = intent.categories?.contains(Intent.CATEGORY_HOME) == true
+        if (!isHome) {
+            setIntent(intent)
+            return
+        }
         // 特意不把带 CATEGORY_HOME 的 intent 存下来：存了之后 Activity 一旦被重建，
-        // onCreate 就会把那次重建误判成「按 Home 冷启动」，又给站在桌面上的孩子弹一道题
-        if (!isHome) setIntent(intent)
-        // 已经在桌面上时按 Home，只是系统再叫一次桌面，不该拿挑战框去打扰孩子；
-        // 只有这一下之前桌面在后台（孩子从别的应用逃回来）才弹，那才是这个开关要拦的。
-        // 守护自己弹回来的那次（孩子开了非白名单应用）也不算，拦回桌面就完事，别再加一道题
-        val front = desktopInFront()
-        val bounced = Store.guardBounceRecent(this)
-        val escape = isHome && !front && !bounced
-        lastHomeDecision =
-            "onNewIntent home=$isHome 桌面已在前台=$front 守护刚弹回=$bounced " +
-                "→ ${if (escape) "弹挑战" else "不打扰"}"
-        Diag.log("act", "$lastHomeDecision （Activity=$inForeground 无障碍看到的当前前台=${fg() ?: "-"}）")
-        if (escape) channel?.invokeMethod("onHomeKey", null)
+        // 那次重建就会拿着这份旧 intent 再判一次（见上面那句 setIntent 只对非 HOME 生效）。
+        //
+        // 判定本身不在这里做，留给紧接着的 onResume：那里的现场一模一样（onNewIntent 早于 onResume，
+        // 读到的仍是「这一下之前」的状态），而且能把「按返回键退出应用」那次一并判掉——
+        // 那次系统根本不发 intent，只有 onResume 这条路看得见。这里只记一笔「这一下是 Home」，
+        // 好在判定和日志里说清楚是哪一种。
+        viaHomeIntent = true
     }
 
     private fun fg(): String? = Store.currentForeground(this)
 
     /**
-     * 「这一下回到桌面」之前，桌面是不是本来就在最前面——是就别弹挑战框。
-     * Activity 自己的前后台状态之外，再看一眼无障碍守护记下的「最前面那个窗口是谁」：
-     * 走冷启动路径、或 ROM 把桌面 Activity 重排重建时，前后台标志已经不可靠，这一路能兜住。
+     * 桌面这一次露面该不该弹挑战框。默认不弹——桌面是孩子的家，他站在家里按 Home 什么都不该发生。
+     * 只有拿到「他是从别处回来的」的正面证据才弹，证据按可靠程度排：
+     *
+     *  ① 无障碍守护记的窗口链（最结实）：桌面露头之前最前面的是谁。是孩子白名单里的应用，
+     *     就是他刚从那个应用里退出来——按 Home 也好、按返回键退出应用也好，在这儿看是一回事；
+     *     是本应用自己的页面（密码页、乘法挑战页、同意页），那就不是从应用里逃出来的；
+     *  ② 兜底（家长没开无障碍时）：最后露头的是别的应用 / 桌面这次回来前离开过屏幕 /
+     *     Activity 已经离开前台一段时间了。
+     *
+     * 兜底那几条都要求证据「放了一会儿」：这一下露面本身就会把桌面拉到最前、把 Activity
+     * 暂停/重建，那些变化都在毫秒之前，是这一下自己造成的，不算数——[FRESH_MS] 就是这条线。
      */
-    private fun desktopInFront(): Boolean = inForeground || desktopWasInFront()
+    private fun judgeAppearance(): Pair<Boolean, String> {
+        val now = SystemClock.elapsedRealtime()
+        val self = Store.selfForegroundAt(this)
+        val other = Store.otherForegroundAt(this)
+        val front = Store.currentForeground(this) ?: "-"
+        val before = GuardAccessibilityService.beforeLauncher(packageName)
+        val allowedList = Store.allowed(this)
+        val leftScreen = leftScreenAt
+        val leftFg = if (leftForegroundAt == 0L) -1L else now - leftForegroundAt
+        val viaHome = viaHomeIntent
 
-    /** 只认无障碍那一路：冷启动时 inForeground 一定是 true（刚 onResume 过），单靠它会把冷启动全放过 */
-    private fun desktopWasInFront(): Boolean =
-        Store.accessibilityOn(this) && Store.currentForeground(this) == packageName
+        val verdict = when {
+            // 守护自己刚把他弹回来的那次（孩子开了非白名单应用）不算他按的 Home，拦回桌面就完事
+            Store.guardBounceRecent(this) -> false to "守护刚把他弹回桌面"
+            // 家长刚从系统设置那趟回来（放行还没收回）：这一下是他自己按的 Home，
+            // 不该让他再做一道题，否则家长外出办事回来还得答题才能用桌面
+            Store.parentFreeActive(this) -> false to "家长刚在放行期里（去过系统设置之类）"
+            // 「」= 无障碍看见桌面之前是本应用自己的页面（密码页/乘法挑战页/同意页盖在上面），
+            // 那不是从应用里逃出来的——这条要排在兜底证据前面，否则锁屏页一关就误判成逃回桌面
+            before != null && before.isEmpty() -> false to "刚才盖在上面的是本应用自己的页面"
+            before != null && before in allowedList ->
+                true to "无障碍看见桌面之前是 $before（孩子白名单里的应用）"
+            other > self -> true to "最后露头的是别的应用（$front，${ago(now, other)}前）"
+            leftScreen != 0L && now - leftScreen >= FRESH_MS ->
+                true to "桌面这次回来前离开过屏幕（${ago(now, leftScreen)}前）"
+            leftFg >= FRESH_MS -> true to "Activity 已离开前台 ${leftFg}ms"
+            else -> false to "没拿到「从别处回来」的证据（最前=$front，桌面之前=${before ?: "（看不出）"}，" +
+                "离开前台 ${leftFg}ms）"
+        }
+        Diag.log(
+            "home",
+            "露面判定（${if (viaHome) "按 Home 键" else "没有 Home intent（按返回键退出应用之类）"}）：" +
+                "桌面最后在前 ${ago(now, self)}前、别的应用 ${ago(now, other)}前、" +
+                "桌面之前=${before ?: "（看不出）"}、leftScreen=${ago(now, leftScreen)}前、" +
+                "leftFg=${leftFg}ms、最前=$front → ${if (verdict.first) "弹挑战" else "不打扰"}",
+        )
+        lastHomeDecision =
+            "桌面这次露面：${verdict.second} → ${if (verdict.first) "弹挑战" else "不打扰"}"
+        consumeHomeEvidence()
+        return verdict
+    }
+
+    /**
+     * 判定即消费：这一次露面已经有结论了，现场立刻归位成「他此刻就站在桌面上」。
+     *
+     * 不消费的话同一批证据会一直挂着——孩子答对题回到桌面后，每按一次 Home 都会再弹一道
+     * （1.0.9 真机反馈：在别的应用按 home 答对后，以后按 home 都弹对话框）。证据全部作废，
+     * 并把「桌面此刻在最前面」记下来，下一次判定自然就是「他站在桌面上」。
+     */
+    private fun consumeHomeEvidence() {
+        leftScreenAt = 0L
+        leftForegroundAt = 0L
+        Store.noteForeground(this, packageName, countAsApp = false)
+    }
+
+    /** 「多久以前」的可读文本，给日志用 */
+    private fun ago(now: Long, at: Long): String =
+        if (at == 0L) "（从没记过）" else "${now - at}ms"
 
     override fun onResume() {
         super.onResume()
         inForeground = true
+        // 桌面这一次露面要不要弹挑战框。判定必须赶在下面清现场之前——那时读到的才是
+        // 「这一次露面之前」的状态。每一次露面只判一次：孩子按 Home 让系统把桌面重新拉起来、
+        // 可桌面本来就在最前面时（没有 onPause/onResume 那一轮）根本走不到这里，
+        // 系统真把它重新拉起来的那种也已经在这一次判过了，不会再翻出上一次用过的应用弹题
+        val escape = if (appearanceJudged) null else judgeAppearance()
+        appearanceJudged = true
+        val viaHome = viaHomeIntent
+        viaHomeIntent = false
+        // 桌面又到前台了：之前那份「他离开过屏幕 / Activity 离开前台」的证据一律作废。
+        // 他是从这个状态开始待在桌面上的，接下来再按 Home 就是「站在桌面上按的」。
+        leftScreenAt = 0L
+        leftForegroundAt = 0L
+        // 上面这两条一律清掉是安全的：该不该弹挑战框在上面就判完了，读到的还是
+        // 「这一次露面之前」的现场，不会被这里的归零抹掉
+        // 桌面此刻确实在最前面，自己记一笔：不依赖无障碍服务有没有把这一下报上来
+        Store.noteForeground(this, packageName, countAsApp = false)
+        if (escape != null && escape.first) {
+            // 从别处逃回桌面。按 Home 的那次走 onHomeKey（老路），
+            // 按返回键退出应用的那次系统连 intent 都不发，走 onBackEscape
+            if (viaHome) channel?.invokeMethod("onHomeKey", null)
+            else channel?.invokeMethod("onBackEscape", null)
+        }
         val nowDefault = Store.isDefaultLauncher(this)
         if (nowDefault != lastDefault) {
             Diag.log(
@@ -112,6 +211,8 @@ class MainActivity : FlutterActivity() {
             lastDefault = nowDefault
         }
         Store.onLauncherResume(this)
+        // 桌面在前台了 = 孩子离开了刚才那个应用，单次时长的会话到此为止
+        GuardAccessibilityService.onDesktopShown()
         // 家长已经从系统设置那边回来了，前台守护立刻恢复管控
         Store.clearParentFree(this)
         // 超时 / 超次数 → 拉起密码锁屏
@@ -119,11 +220,26 @@ class MainActivity : FlutterActivity() {
             Diag.log("gate", "命中限制 $it，拉起密码页")
             Store.showLock(this, it)
         }
+        // 有设备在等「同意」而同意页当时没能弹出来（后台启动被系统拦了），这里补一次
+        HttpGateway.onLauncherResume(this)
+        // 进程可能是被系统重启的，服务该开没开的话在这里补上
+        applyFileServer()
     }
 
     override fun onPause() {
         inForeground = false
+        leftForegroundAt = SystemClock.elapsedRealtime()
+        // 桌面要离开前台了：下一次回到最前面算一次新露面，得重新判（见 judgeAppearance）。
+        // 孩子站在桌面上按 Home 不经过这里，所以那一下不会被当成一次新露面
+        appearanceJudged = false
         super.onPause()
+    }
+
+    override fun onStop() {
+        // 桌面被别的应用整个盖住了（不只是被弹框遮一下）。再回到桌面时，
+        // 这就是「他刚从别处回来」的硬证据；自己切回来那次会在 onResume 里作废
+        leftScreenAt = SystemClock.elapsedRealtime()
+        super.onStop()
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -206,26 +322,19 @@ class MainActivity : FlutterActivity() {
         when (method) {
             "config" -> {
                 val m = HashMap<String, Any>(Store.configMap(this))
-                // 冷启动也可能是守护弹回来的（进程被杀过），或者本来就是系统重排桌面——
-                // 孩子一直站在桌面上，这两种都不该弹挑战框
-                var coldHome = false
-                if (launchedAsHome) {
-                    val front = desktopWasInFront()
-                    val bounced = Store.guardBounceRecent(this)
-                    coldHome = !bounced && !front
-                    lastHomeDecision =
-                        "冷启动 桌面已在前台=$front 守护刚弹回=$bounced " +
-                            "→ ${if (coldHome) "弹挑战" else "不打扰"}"
-                    Diag.log("home", "$lastHomeDecision")
-                }
-                m["coldStartHome"] = coldHome
-                launchedAsHome = false
+                // onCreate 那次「按 Home / 开机把桌面拉起来」的判定（冷启动与 Activity 重建都走这里）。
+                // 判据、日志、lastHomeDecision 都已经由 judgeAppearance 处理过，这里只把它交给 Dart：
+                // Dart 侧据此决定要不要在界面起来后补一个挑战框
+                val home = pendingHome
+                pendingHome = null
+                m["coldStartHome"] = home?.first == true
                 result.success(m)
             }
             @Suppress("UNCHECKED_CAST")
             "updateConfig" -> {
                 Store.applyConfig(this, args as Map<String, Any?>)
                 applyGuardState()
+                applyFileServer()
                 result.success(Store.configMap(this))
             }
             "listApps" -> result.success(listApps())
@@ -289,6 +398,16 @@ class MainActivity : FlutterActivity() {
                 applyGuardState()
                 result.success(Store.configMap(this))
             }
+            "setFileServer" -> {
+                Store.applyConfig(this, mapOf("fileServerOn" to (args as Boolean)))
+                applyFileServer()
+                result.success(Store.configMap(this))
+            }
+            // Dart 侧的关键决策也写进同一份日志文件，事后一起下载下来看
+            "diagLog" -> {
+                Diag.log("dart", args as? String ?: "")
+                result.success(true)
+            }
             "defaultLauncherName" -> result.success(defaultLauncherLabel())
             else -> result.notImplemented()
         }
@@ -312,6 +431,20 @@ class MainActivity : FlutterActivity() {
         val i = Intent(this, GuardService::class.java)
         if (Store.guardEnabled(this)) {
             ContextCompat.startForegroundService(this, i)
+        } else {
+            stopService(i)
+        }
+    }
+
+    /** 文件传输服务的开关同样落到服务上：开着就拉起前台服务，关掉就停 */
+    private fun applyFileServer() {
+        val i = Intent(this, FileServerService::class.java)
+        if (Store.fileServerOn(this)) {
+            try {
+                ContextCompat.startForegroundService(this, i)
+            } catch (e: Exception) {
+                Diag.log("http", "拉起文件传输服务失败：${e.javaClass.simpleName}: ${e.message}")
+            }
         } else {
             stopService(i)
         }
@@ -607,9 +740,27 @@ class MainActivity : FlutterActivity() {
         sb.appendLine("无障碍服务已在系统里启用：${Store.accessibilityOn(this)}")
         sb.appendLine("家长放行中（暂不拦截）：${Store.parentFreeActive(this)}")
         sb.appendLine("放行时长设置：${Store.settingsFreeMin(this)} 分钟")
-        sb.appendLine("无障碍看到的当前前台：${fg() ?: "（还没记录）"}")
         sb.appendLine("非白名单应用一露头就被送回桌面；「最近任务」那一屏直接退掉，孩子留在当前应用")
+        sb.appendLine("放行的系统「选文件」界面（孩子从应用里点「选视频」必经这一屏，不当换应用处理）：")
+        sb.append(GuardAccessibilityService.pickerReport())
         sb.appendLine("最近几次拦截见下面日志里的 [guard] 行")
+        sb.appendLine()
+        sb.appendLine("── 单次使用时长（每个白名单应用各算一次）──")
+        sb.append(GuardAccessibilityService.sessionReport(this))
+        sb.appendLine()
+        sb.appendLine("── 从应用回到桌面的判定现场（按 Home 键 / 按返回键退出应用都算）──")
+        sb.appendLine("挑战开关：回到桌面时（从别的应用逃回来）${Store.challengeOnHome(this)} / 启动应用 ${Store.challengeOnLaunch(this)}")
+        sb.appendLine("无障碍看到的当前前台：${fg() ?: "（还没记录）"}")
+        sb.appendLine("桌面自己最后一次在最前面：${agoOf(Store.selfForegroundAt(this))}")
+        sb.appendLine("别的应用最后一次在最前面：${agoOf(Store.otherForegroundAt(this))}")
+        sb.appendLine("回到桌面挑战没过会送回的应用：${Store.lastForeign(this) ?: "（还没记录）"}")
+        sb.appendLine("上一次「桌面露面」的判定：${lastHomeDecision ?: "（本次运行还没回到过桌面）"}")
+        sb.appendLine(
+            "桌面离开屏幕 / 离开前台的记录：leftScreen=${agoOf(leftScreenAt)}、leftFg=${agoOf(leftForegroundAt)}" +
+                "（每次判定都会消费掉，消费后显示「还没记录」是正常的）"
+        )
+        sb.appendLine("【最结实的那路证据】无障碍记的窗口链：")
+        sb.append(GuardAccessibilityService.frontReport(this))
         sb.appendLine()
         sb.appendLine("── 白名单（★ = 点开直接进，不弹挑战）──")
         val noCh = Store.noChallenge(this)
@@ -618,13 +769,33 @@ class MainActivity : FlutterActivity() {
             if (allowedList.isEmpty()) "  （空，孩子只能看到家长设置）"
             else allowedList.joinToString("\n") { p -> (if (p in noCh) "  ★ " else "  · ") + p }
         )
-        sb.appendLine("挑战总开关：按 Home（从别的应用逃回来时）${Store.challengeOnHome(this)} / 启动应用 ${Store.challengeOnLaunch(this)}")
-        sb.appendLine("按 Home 挑战没过会送回的应用：${Store.lastForeign(this) ?: "（还没记录）"}")
-        sb.appendLine("上一次「回到桌面」的判定：${lastHomeDecision ?: "（本次运行还没回到过桌面）"}")
+        sb.appendLine()
+        sb.appendLine("── 文件传输（浏览器连本机下载日志 / 上传文件）──")
+        sb.append(HttpGateway.report(this))
         sb.appendLine()
         sb.appendLine("── 运行日志（共 ${Diag.size()} 条，从旧到新）──")
         sb.append(Diag.dump())
-        return sb.toString()
+
+        // 同一份报告也存成文件：家长光看这一屏不方便，开了文件传输就能用浏览器下下来发给我
+        val text = sb.toString()
+        val saved = Diag.writeReport(this, text)
+        if (saved == null) return text
+        return text +
+            "\n\n═══ 这一份已存成文件 ═══\n${saved.absolutePath}\n" +
+            "运行日志同时追加在：${Diag.logFile(this).absolutePath}\n" +
+            "在「文件传输」里用浏览器打开 ${HttpGateway.urlOrEmpty(this).ifEmpty { "（服务还没开）" }} 就能下载。\n"
+    }
+
+    /** 「多久以前」的可读文本，0 = 从没记过 */
+    private fun agoOf(at: Long): String {
+        if (at == 0L) return "（还没记录）"
+        val s = (SystemClock.elapsedRealtime() - at) / 1000
+        return when {
+            s < 0 -> "（时钟比记录还早，重启过？）"
+            s < 60 -> "${s} 秒前"
+            s < 3600 -> "${s / 60} 分钟前"
+            else -> "${s / 3600} 小时前"
+        }
     }
 
     private fun defaultLauncherLabel(): String =
@@ -634,10 +805,19 @@ class MainActivity : FlutterActivity() {
         const val CHANNEL = "child_launcher/native"
         private const val REQ_HOME_ROLE = 201
 
-        /** 进程级：只有本进程第一次创建 Activity 才算「按 Home 冷启动」，之后重建都不算 */
-        private var processStarted = false
+        /**
+         * 「这一下按 Home 造成的现场变化」都在这么新以内，不作数。按 Home 会把桌面拉到最前、
+         * 把 Activity 暂停/重建，这些变化就发生在毫秒前；只有比这更早就成立的状态才算「他本来就在桌面上」。
+         */
+        private const val FRESH_MS = 1200L
 
         /** 图标统一编码成这么大，够桌面磁贴用，又不至于把通道塞爆 */
         private const val ICON_PX = 128
+
+        /** Activity 最后一次离开前台的时刻。进程级：Activity 被重建时，那是上一个实例留下的 */
+        private var leftForegroundAt = 0L
+
+        /** 桌面这次回到最前面之前真的离开过屏幕（onStop）的时刻，0 = 没有 */
+        private var leftScreenAt = 0L
     }
 }

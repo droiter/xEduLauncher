@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">儿童桌面</string>
-    <string name="guard_accessibility_summary">防止孩子切到没被允许的应用</string>
-    <string name="guard_accessibility_desc">只做两件事：\n\n①判断当前前台应用是不是家长允许孩子用的应用，不是的话立刻把儿童桌面拉回来；\n\n②「最近任务」那一屏直接退掉——孩子按任务键也切不出去，仍旧留在当前应用里。\n\n这样孩子就没法从通知或最近任务点开一个已经在后台运行的应用（比如系统设置）绕过家长控制。\n\n本应用不读取屏幕内容，不联网，不记录你看了什么。</string>
+    <string name="guard_accessibility_summary">防止孩子切到没被允许的应用，并给单次使用时长计时</string>
+    <string name="guard_accessibility_desc">只做三件事：\n\n①判断当前前台应用是不是家长允许孩子用的应用，不是的话立刻把儿童桌面拉回来；\n\n②记下孩子在某个应用里连续用了多久——到家长设的时长就在他那个应用上弹一道算术题（题由应用自己弹出）；\n\n③「最近任务」那一屏直接退掉——孩子按任务键也切不出去，仍旧留在当前应用里。\n\n这样孩子就没法从通知或最近任务点开一个已经在后台运行的应用（比如系统设置）绕过家长控制。\n\n本应用不读取屏幕内容，不记录你看了什么；只有家长在设置里手动打开「文件传输」时才会在本机开一个端口，等家长从自己的电脑连过来。</string>
 </resources>

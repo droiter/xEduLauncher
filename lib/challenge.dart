@@ -67,7 +67,6 @@ class _MathDialog extends StatefulWidget {
 
 class _MathDialogState extends State<_MathDialog> {
   final _controller = TextEditingController();
-  String? _error;
 
   @override
   void dispose() {
@@ -75,16 +74,10 @@ class _MathDialogState extends State<_MathDialog> {
     super.dispose();
   }
 
+  /// 只有一次机会：算对放行，算错就直接算没通过（没有第二次，也没有取消可退）
   void _submit() {
     final v = int.tryParse(_controller.text.trim());
-    if (v == widget.answer) {
-      Navigator.of(context).pop(true);
-    } else {
-      setState(() {
-        _error = '答错了，再试一次';
-        _controller.clear();
-      });
-    }
+    Navigator.of(context).pop(v == widget.answer);
   }
 
   @override
@@ -92,7 +85,7 @@ class _MathDialogState extends State<_MathDialog> {
     return _Shell(
       icon: Icons.calculate_outlined,
       title: widget.title,
-      subtitle: '算对了才能继续哦',
+      subtitle: '算对了才能继续，只有一次机会',
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -114,12 +107,8 @@ class _MathDialogState extends State<_MathDialog> {
             ),
             onSubmitted: (_) => _submit(),
           ),
-          if (_error != null) ...[
-            const SizedBox(height: 10),
-            Text(_error!, style: const TextStyle(color: Colors.red)),
-          ],
           const SizedBox(height: 20),
-          _Actions(onOk: _submit, onCancel: () => Navigator.of(context).pop(false)),
+          _Actions(onOk: _submit),
         ],
       ),
     );
@@ -277,22 +266,27 @@ class _Shell extends StatelessWidget {
 }
 
 class _Actions extends StatelessWidget {
-  const _Actions({required this.onOk, required this.onCancel});
+  const _Actions({required this.onOk, this.onCancel});
 
   final VoidCallback? onOk;
-  final VoidCallback onCancel;
+
+  /// 为 null 时只有「确定」一个按钮（算术挑战没有退路，答错就是没通过）
+  final VoidCallback? onCancel;
 
   @override
   Widget build(BuildContext context) {
+    final cancel = onCancel;
     return Row(
       children: [
-        Expanded(
-          child: OutlinedButton(
-            onPressed: onCancel,
-            child: const Text('取消'),
+        if (cancel != null) ...[
+          Expanded(
+            child: OutlinedButton(
+              onPressed: cancel,
+              child: const Text('取消'),
+            ),
           ),
-        ),
-        const SizedBox(width: 12),
+          const SizedBox(width: 12),
+        ],
         Expanded(
           child: FilledButton(
             onPressed: onOk,

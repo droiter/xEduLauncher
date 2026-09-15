@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.SystemClock
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -27,6 +28,7 @@ object Store {
     private const val K_PARENT_FREE_UNTIL = "parent_free_until"
     private const val K_SETTINGS_FREE_MIN = "settings_free_minutes"
     private const val K_DAILY_LIMIT_MIN = "daily_limit_minutes"
+    private const val K_SINGLE_USE_MIN = "single_use_minutes"
     private const val K_GRACE_MIN = "grace_minutes"
     private const val K_OPEN_LIMIT = "open_limit"
     private const val K_USED_SECONDS = "used_seconds"
@@ -38,8 +40,18 @@ object Store {
     private const val K_LAST_FOREIGN = "last_foreign_pkg"
     private const val K_BOUNCE_AT = "guard_bounce_at"
     private const val K_CURRENT_FG = "current_foreground_pkg"
+    private const val K_SELF_FG_AT = "self_foreground_at"
+    private const val K_OTHER_FG_AT = "other_foreground_at"
+    private const val K_FILE_SERVER = "file_server_enabled"
+    private const val K_APPROVED_IPS = "file_server_approved_ips"
 
     const val DEFAULT_PASSWORD = "123456"
+
+    /** 文件传输服务默认端口；被占用时由 HttpGateway 往后顺延 */
+    const val DEFAULT_FILE_PORT = 8080
+
+    /** 单次使用时长缺省值：家长不设也有 5 分钟 */
+    const val DEFAULT_SINGLE_USE_MIN = 5
 
     /** 距上次进入桌面超过该毫秒数，才把本次进入算作一次新的“打开” */
     private const val NEW_OPEN_GAP_MS = 120_000L
@@ -99,6 +111,12 @@ object Store {
     fun settingsFreeMin(ctx: Context) = num(ctx, K_SETTINGS_FREE_MIN, 10)
 
     fun dailyLimitMin(ctx: Context) = num(ctx, K_DAILY_LIMIT_MIN, 0)
+
+    /**
+     * 单次使用时长上限（分钟），0 = 不限。算的是「连续待在同一个白名单应用里」的时长，
+     * 由无障碍守护按窗口切换计时，到点弹一道一位数乘法：答对清零重新计时，答错送回桌面。
+     */
+    fun singleUseMin(ctx: Context) = num(ctx, K_SINGLE_USE_MIN, DEFAULT_SINGLE_USE_MIN)
     fun graceMin(ctx: Context) = num(ctx, K_GRACE_MIN, 10)
     fun openLimit(ctx: Context) = num(ctx, K_OPEN_LIMIT, 0)
     fun usedSeconds(ctx: Context) = num(ctx, K_USED_SECONDS, 0)
@@ -164,6 +182,9 @@ object Store {
         prefs.edit()
             .putInt(K_OPEN_COUNT, prefs.getInt(K_OPEN_COUNT, 0) + 1)
             .putLong(K_LAST_RESUME, SystemClock.elapsedRealtime())
+            // 重启后 elapsedRealtime 归零，重启前记的前台时刻再也对不上谁的先谁后，清掉免得判反
+            .putLong(K_SELF_FG_AT, 0L)
+            .putLong(K_OTHER_FG_AT, 0L)
             .apply()
     }
 
@@ -191,6 +212,20 @@ object Store {
         }
     }
 
+    /** 单次使用时长到点：在孩子正用着的那个应用之上弹出乘法挑战页 */
+    fun showSessionChallenge(ctx: Context, pkg: String) {
+        if (SessionChallengeActivity.showing) return
+        val i = Intent(ctx, SessionChallengeActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            .putExtra(SessionChallengeActivity.EXTRA_PKG, pkg)
+        try {
+            ctx.startActivity(i)
+        } catch (e: Exception) {
+            // 后台启动 Activity 需要悬浮窗权限，没有的话只能放弃这一次挑战（计时已停，不会再连环弹）
+            Diag.log("session", "弹乘法挑战页失败：${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
     // ---------- Home 键挑战的现场 ----------
 
     /**
@@ -210,14 +245,29 @@ object Store {
 
     /**
      * 此刻出现在最前面的窗口属于哪个包（前台守护在窗口切换时记，包括本应用自己的桌面）。
-     * 两个用途：桌面按 Home 时判断「他本来就站在桌面上」；最近任务被拦下时知道该把他退回哪。
+     * 同时按「是不是本应用」把时刻分开记：桌面判「这一次露面是不是从应用里逃出来的」时，
+     * 除了无障碍那条窗口链（首选，见 GuardAccessibilityService.beforeLauncher），还要靠这两个
+     * 时刻谁更晚来兜底——比只比包名结实，输入法/状态栏/系统桌面这类一闪而过的窗口不会把结论带偏。
+     * [countAsApp] 由守护判定：只有孩子真在用的应用才算「别的应用」，见 GuardAccessibilityService。
      */
-    fun noteForeground(ctx: Context, pkg: String) {
-        p(ctx).edit().putString(K_CURRENT_FG, pkg).apply()
+    fun noteForeground(ctx: Context, pkg: String, countAsApp: Boolean) {
+        val e = p(ctx).edit().putString(K_CURRENT_FG, pkg)
+        if (pkg == ctx.packageName) {
+            e.putLong(K_SELF_FG_AT, SystemClock.elapsedRealtime())
+        } else if (countAsApp) {
+            e.putLong(K_OTHER_FG_AT, SystemClock.elapsedRealtime())
+        }
+        e.apply()
     }
 
     fun currentForeground(ctx: Context): String? =
         p(ctx).getString(K_CURRENT_FG, "")?.takeIf { it.isNotBlank() }
+
+    /** 本应用（桌面/密码页）最后一次出现在最前面的时刻 */
+    fun selfForegroundAt(ctx: Context): Long = p(ctx).getLong(K_SELF_FG_AT, 0L)
+
+    /** 孩子用的别的应用最后一次出现在最前面的时刻 */
+    fun otherForegroundAt(ctx: Context): Long = p(ctx).getLong(K_OTHER_FG_AT, 0L)
 
     /** 前台守护刚用 GLOBAL_ACTION_HOME 把孩子弹回桌面（防他打开非白名单应用），记下时刻 */
     fun noteGuardBounce(ctx: Context) {
@@ -230,6 +280,31 @@ object Store {
      */
     fun guardBounceRecent(ctx: Context): Boolean =
         SystemClock.elapsedRealtime() - p(ctx).getLong(K_BOUNCE_AT, 0L) < GUARD_BOUNCE_WINDOW_MS
+
+    // ---------- 文件传输服务 ----------
+
+    /**
+     * 家长在设置里打开的文件传输服务：手机浏览器连上就能下载日志、上传视频。
+     * 每个新连上来的设备都要在手机上点一次「同意」（见 HttpConsentActivity）。
+     */
+    fun fileServerOn(ctx: Context) = bool(ctx, K_FILE_SERVER, false)
+
+    /** 已同意过的设备 IP（关掉服务时清空，下次开启重新问） */
+    fun approvedIps(ctx: Context): Set<String> =
+        p(ctx).getStringSet(K_APPROVED_IPS, emptySet()) ?: emptySet()
+
+    fun approveIp(ctx: Context, ip: String) {
+        p(ctx).edit().putStringSet(K_APPROVED_IPS, approvedIps(ctx) + ip).apply()
+        Diag.log("http", "家长同意了 $ip 的连接")
+    }
+
+    fun revokeIps(ctx: Context) {
+        p(ctx).edit().putStringSet(K_APPROVED_IPS, emptySet()).apply()
+    }
+
+    /** 文件传输服务和日志共用的根目录：/sdcard/Android/data/<包名>/files */
+    fun filesRoot(ctx: Context): File =
+        ctx.getExternalFilesDir(null) ?: File(ctx.filesDir, "external")
 
     // ---------- 家长外出放行 ----------
 
@@ -293,6 +368,7 @@ object Store {
             "allowed" to allowed(ctx),
             "noChallenge" to noChallenge(ctx).sorted(),
             "dailyLimitMin" to dailyLimitMin(ctx),
+            "singleUseMin" to singleUseMin(ctx),
             "graceMin" to graceMin(ctx),
             "openLimit" to openLimit(ctx),
             "usedSeconds" to usedSeconds(ctx),
@@ -304,6 +380,8 @@ object Store {
             "frontGuard" to frontGuard(ctx),
             "accessibilityOn" to accessibilityOn(ctx),
             "settingsFreeMin" to settingsFreeMin(ctx),
+            "fileServerOn" to fileServerOn(ctx),
+            "fileServerUrl" to HttpGateway.urlOrEmpty(ctx),
         )
     }
 
@@ -328,11 +406,13 @@ object Store {
             )
         }
         (m["dailyLimitMin"] as? Number)?.let { e.putInt(K_DAILY_LIMIT_MIN, it.toInt()) }
+        (m["singleUseMin"] as? Number)?.let { e.putInt(K_SINGLE_USE_MIN, it.toInt().coerceIn(0, 120)) }
         (m["graceMin"] as? Number)?.let { e.putInt(K_GRACE_MIN, it.toInt()) }
         (m["openLimit"] as? Number)?.let { e.putInt(K_OPEN_LIMIT, it.toInt()) }
         (m["guardEnabled"] as? Boolean)?.let { e.putBoolean(K_GUARD_ENABLED, it) }
         (m["frontGuard"] as? Boolean)?.let { e.putBoolean(K_FRONT_GUARD, it) }
         (m["settingsFreeMin"] as? Number)?.let { e.putInt(K_SETTINGS_FREE_MIN, it.toInt()) }
+        (m["fileServerOn"] as? Boolean)?.let { e.putBoolean(K_FILE_SERVER, it) }
         e.apply()
     }
 }

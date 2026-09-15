@@ -63,6 +63,11 @@ class Native {
   /// 按 Home 键回到桌面时自增，UI 监听它来弹挑战框
   static final ValueNotifier<int> homeKey = ValueNotifier<int>(0);
 
+  /// 「从应用里按返回键退出、回到了桌面」时自增，UI 监听它来弹挑战框。
+  /// 和 [homeKey] 分开是因为横幅上要写清楚孩子是怎么出来的——这一次系统连 intent 都不发，
+  /// 只有无障碍守护看得见（见 GuardAccessibilityService.beforeLauncher）
+  static final ValueNotifier<int> backEscape = ValueNotifier<int>(0);
+
   /// 「默认桌面」的最终结局。系统弹框盖在界面上时 Dart 拿不到结果，
   /// 由原生侧在弹框/设置页那边尘埃落定后推回来。
   static final ValueNotifier<HomeSettingsResult?> homeResult =
@@ -73,6 +78,8 @@ class Native {
       switch (call.method) {
         case 'onHomeKey':
           homeKey.value++;
+        case 'onBackEscape':
+          backEscape.value++;
         case 'onHomeResult':
           homeResult.value = HomeSettingsResult.fromMap(
             (call.arguments as Map?) ?? const {},
@@ -117,7 +124,8 @@ class Native {
   static Future<bool> launchApp(String package) async =>
       await _ch.invokeMethod<bool>('launchApp', package) ?? false;
 
-  /// 按 Home 键的挑战没答对：把孩子送回他刚才在用的那个应用（原生侧记着是哪个）。
+  /// 「从应用回到桌面」的挑战没答对（按 Home 键或按返回键退出应用都算）：
+  /// 把孩子送回他刚才在用的那个应用（原生侧记着是哪个）。
   /// 返回 false 表示没有可送回去的应用，孩子只能留在桌面。
   static Future<bool> returnToLastApp() async =>
       await _ch.invokeMethod<bool>('returnToLastApp') ?? false;
@@ -154,6 +162,15 @@ class Native {
 
   static Future<LauncherConfig> setGuard(bool enabled) async =>
       LauncherConfig.fromMap(await _ch.invokeMethod('setGuard', enabled) ?? {});
+
+  /// 开关文件传输服务（浏览器连本机下载日志、上传文件）
+  static Future<LauncherConfig> setFileServer(bool enabled) async =>
+      LauncherConfig.fromMap(await _ch.invokeMethod('setFileServer', enabled) ?? {});
+
+  /// 把关键决策写进原生那份日志文件——家长只有真机能复现的问题，事后要能从日志里看出来
+  static void log(String msg) {
+    _ch.invokeMethod('diagLog', msg).then((_) {}, onError: (Object _) {});
+  }
 
   static Future<String> defaultLauncherName() async =>
       await _ch.invokeMethod<String>('defaultLauncherName') ?? '未知';

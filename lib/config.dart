@@ -15,6 +15,9 @@ class LauncherConfig {
   /// [allowed] 里「点开直接进、不弹挑战」的那部分
   List<String> noChallenge;
   int dailyLimitMin;
+
+  /// 单次使用时长上限（分钟，0 = 不限）：孩子在同一个白名单应用里连续用满这么久就弹乘法题
+  int singleUseMin;
   int graceMin;
   int openLimit;
   int usedSeconds;
@@ -33,6 +36,12 @@ class LauncherConfig {
   /// 家长外出系统设置时的放行时长（分钟）
   int settingsFreeMin;
 
+  /// 文件传输服务：浏览器连上本机下载日志、上传文件（每台新设备要在设备上点一次「同意」）
+  bool fileServerOn;
+
+  /// 服务实际跑起来的访问地址，形如 http://192.168.1.23:8080；服务没开时是空串
+  String fileServerUrl;
+
   /// 本次进程是否因「按 Home 键」而启动
   bool coldStartHome;
 
@@ -46,6 +55,7 @@ class LauncherConfig {
     this.allowed = const [],
     this.noChallenge = const [],
     this.dailyLimitMin = 0,
+    this.singleUseMin = 5,
     this.graceMin = 10,
     this.openLimit = 0,
     this.usedSeconds = 0,
@@ -57,6 +67,8 @@ class LauncherConfig {
     this.frontGuard = false,
     this.accessibilityOn = false,
     this.settingsFreeMin = 10,
+    this.fileServerOn = false,
+    this.fileServerUrl = '',
     this.coldStartHome = false,
   });
 
@@ -70,6 +82,7 @@ class LauncherConfig {
     allowed: (m['allowed'] as List?)?.cast<String>() ?? const [],
     noChallenge: (m['noChallenge'] as List?)?.cast<String>() ?? const [],
     dailyLimitMin: (m['dailyLimitMin'] as num?)?.toInt() ?? 0,
+    singleUseMin: (m['singleUseMin'] as num?)?.toInt() ?? 5,
     graceMin: (m['graceMin'] as num?)?.toInt() ?? 10,
     openLimit: (m['openLimit'] as num?)?.toInt() ?? 0,
     usedSeconds: (m['usedSeconds'] as num?)?.toInt() ?? 0,
@@ -81,6 +94,8 @@ class LauncherConfig {
     frontGuard: m['frontGuard'] as bool? ?? false,
     accessibilityOn: m['accessibilityOn'] as bool? ?? false,
     settingsFreeMin: (m['settingsFreeMin'] as num?)?.toInt() ?? 10,
+    fileServerOn: m['fileServerOn'] as bool? ?? false,
+    fileServerUrl: m['fileServerUrl'] as String? ?? '',
     coldStartHome: m['coldStartHome'] as bool? ?? false,
   );
 

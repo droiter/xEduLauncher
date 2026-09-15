@@ -2,6 +2,8 @@
 
     <!-- 列举已安装应用：用 <queries> 声明即可，无需 QUERY_ALL_PACKAGES 敏感权限 -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- 文件传输服务：在本机监听端口等家长连过来。除了这一个套接字，应用不向外发任何请求 -->
+    <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -48,6 +50,28 @@
             android:turnScreenOn="true"
             android:theme="@style/LockTheme" />
 
+        <!-- 单次使用时长到点：盖在孩子正用着的应用之上弹一道一位数乘法。
+             不设 showWhenLocked——息屏时不计时，本来也不会弹。 -->
+        <activity
+            android:name=".SessionChallengeActivity"
+            android:exported="false"
+            android:launchMode="singleInstance"
+            android:excludeFromRecents="true"
+            android:taskAffinity=".challenge"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/ChallengeTheme" />
+
+        <!-- 有设备请求连接文件传输服务时的同意页：透明窗口，盖在任何界面之上 -->
+        <activity
+            android:name=".HttpConsentActivity"
+            android:exported="false"
+            android:launchMode="singleInstance"
+            android:excludeFromRecents="true"
+            android:taskAffinity=".consent"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:theme="@style/ChallengeTheme" />
+
         <!-- 计时守护前台服务 -->
         <service
             android:name=".GuardService"
@@ -56,6 +80,16 @@
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="parental_control_screen_time_watch" />
+        </service>
+
+        <!-- 文件传输服务：家长开着它才能在浏览器里下载日志、上传文件 -->
+        <service
+            android:name=".FileServerService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="parental_control_file_transfer" />
         </service>
 
         <!-- 前台守护：孩子用任务键切回一个还在后台跑的应用时，把它送回桌面。
@@ -103,6 +137,25 @@
         <intent>
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.HOME" />
+        </intent>
+        <!-- 前台守护要放行系统「选文件」那一屏，得先查得到谁是它的宿主。
+             没有这几条，Android 11 起的包可见性过滤会让查询返回空，各家 ROM 自带的
+             文件管理器就漏在放行名单外面（见 GuardAccessibilityService.pickerPackages） -->
+        <intent>
+            <action android:name="android.intent.action.GET_CONTENT" />
+            <category android:name="android.intent.category.OPENABLE" />
+            <data android:mimeType="*/*" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.OPEN_DOCUMENT" />
+            <category android:name="android.intent.category.OPENABLE" />
+            <data android:mimeType="*/*" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.OPEN_DOCUMENT_TREE" />
+        </intent>
+        <intent>
+            <action android:name="android.provider.action.PICK_IMAGES" />
         </intent>
     </queries>
 </manifest>

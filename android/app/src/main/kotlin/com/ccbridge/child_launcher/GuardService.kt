@@ -35,6 +35,9 @@ class GuardService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // 开机后本服务常常先于桌面起来，先接上 Diag：日志从这一刻起就能落到文件里
+        // （家长在「桌面自检」里下载那份文件，看的就是这一段现场）
+        Diag.attach(this)
         startForegroundCompat()
         running = true
         handler.postDelayed(tick, 1000L)

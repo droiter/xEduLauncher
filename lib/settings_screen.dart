@@ -154,10 +154,13 @@ class _SettingsScreenState extends State<SettingsScreen>
                   onTap: _chooseChallengeType,
                 ),
                 SwitchListTile(
-                  title: const Text('按 Home 键回到桌面时挑战'),
+                  title: const Text('从应用回到桌面时挑战'),
                   subtitle: const Text(
-                    '只拦「从别的应用按 Home 逃回桌面」，孩子本来就站在桌面上时不打扰。\n'
-                    '答对才回到桌面；答错或取消，就把他送回刚才那个应用',
+                    '按 Home 键、或在应用里一路按返回键退出来，都算「从别的应用逃回桌面」，都要先答一道题。\n'
+                    '孩子本来就站在桌面上时不打扰。\n'
+                    '答对才留在桌面；答错（或密码题里取消）就把他送回刚才那个应用。\n'
+                    '算术题只有一次机会，答错直接送走，不给第二次。\n'
+                    '按返回键这一路要靠「前台守护」的无障碍权限才看得见',
                   ),
                   value: cfg.chOnHome,
                   onChanged: (v) => _patch({'chOnHome': v}),
@@ -178,6 +181,21 @@ class _SettingsScreenState extends State<SettingsScreen>
                   label: cfg.dailyLimitMin == 0 ? '不限' : '${cfg.dailyLimitMin} 分钟',
                   onPreview: (v) => _cfg!.dailyLimitMin = v,
                   onCommit: (v) => _patch({'dailyLimitMin': v}),
+                ),
+                _sliderTile(
+                  title: '单次使用时长上限',
+                  subtitle:
+                      '孩子在同一个应用里连续用满这么久，就在他那个应用上盖一道一位数乘法题：'
+                      '答对了清零重新计时、接着用；答错了把他送回儿童桌面。\n'
+                      '离开这个应用（回桌面、切到别的应用）就算这一次结束，下次进来重新算。\n'
+                      '需要下面「无障碍权限」开着，否则不知道他正在用哪个应用。',
+                  value: cfg.singleUseMin,
+                  min: 0,
+                  max: 60,
+                  divisions: 12,
+                  label: cfg.singleUseMin == 0 ? '不限' : '${cfg.singleUseMin} 分钟',
+                  onPreview: (v) => _cfg!.singleUseMin = v,
+                  onCommit: (v) => _patch({'singleUseMin': v}),
                 ),
                 _sliderTile(
                   title: '输入密码后宽限时间',
@@ -241,7 +259,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                   subtitle: Text(
                     cfg.accessibilityOn
                         ? '已启用'
-                        : '未启用（前台守护必需，安卓只能靠它知道前台是哪个应用）',
+                        : '未启用（前台守护、单次使用时长都要靠它知道前台是哪个应用）',
                   ),
                   trailing: const Icon(Icons.open_in_new),
                   onTap: () async {
@@ -273,7 +291,10 @@ class _SettingsScreenState extends State<SettingsScreen>
                 ),
                 ListTile(
                   title: const Text('桌面自检'),
-                  subtitle: const Text('设不上默认桌面时点这里，可一键复制发给开发者'),
+                  subtitle: const Text(
+                    '设不上默认桌面、Home 键弹框不对时点这里，可一键复制发给开发者；\n'
+                    '同一份报告和运行日志也会存成文件，可从下面「文件传输」里下载',
+                  ),
                   trailing: const Icon(Icons.bug_report_outlined),
                   onTap: _showDiag,
                 ),
@@ -292,6 +313,37 @@ class _SettingsScreenState extends State<SettingsScreen>
                   trailing: const Icon(Icons.open_in_new),
                   onTap: () => Native.requestNotification(),
                 ),
+
+                _section('文件传输'),
+                SwitchListTile(
+                  title: const Text('文件传输服务'),
+                  subtitle: Text(
+                    !cfg.fileServerOn
+                        ? '打开后，同一 Wi-Fi 下的电脑浏览器就能连上这台设备：下载日志、上传视频等文件。\n'
+                              '每台新设备第一次连上来，这台设备上会弹一个确认框，点「同意」之后对方才看得到文件。'
+                        : cfg.fileServerUrl.isEmpty
+                        ? '已开启，正在取地址…（连上 Wi-Fi 之后再看这一项）'
+                        : '已开启：${cfg.fileServerUrl}\n'
+                              '电脑浏览器打开上面的地址；手机会弹确认框，点「同意」后即可下载/上传。\n'
+                              '下载：日志在 logs/ 里；上传：视频等文件会存到设备的公共下载目录 Download/，'
+                              '其他应用也能看到。',
+                  ),
+                  value: cfg.fileServerOn,
+                  onChanged: _toggleFileServer,
+                ),
+                if (cfg.fileServerOn)
+                  ListTile(
+                    title: const Text('复制访问地址'),
+                    subtitle: Text(
+                      cfg.fileServerUrl.isEmpty ? '还没取到地址，稍后再看' : cfg.fileServerUrl,
+                    ),
+                    trailing: const Icon(Icons.copy_all, size: 20),
+                    onTap: () async {
+                      if (cfg.fileServerUrl.isEmpty) return;
+                      await Clipboard.setData(ClipboardData(text: cfg.fileServerUrl));
+                      _toast('地址已复制，粘到电脑浏览器里打开');
+                    },
+                  ),
 
                 _section('密码'),
                 ListTile(
@@ -377,6 +429,35 @@ class _SettingsScreenState extends State<SettingsScreen>
     }
     final c = await Native.setGuard(v);
     if (mounted) setState(() => _cfg = c);
+  }
+
+  Future<void> _toggleFileServer(bool v) async {
+    if (v) {
+      final go = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('开启文件传输'),
+          content: const Text(
+            '打开后，这台设备会在本机开一个端口，等同一 Wi-Fi 下的电脑连过来：\n\n'
+            '· 电脑浏览器打开设置页里显示的地址；\n'
+            '· 这台设备上会弹出确认框，点「同意」之后对方才能看到文件；\n'
+            '· 之后就能下载 logs/ 里的运行日志、把视频传进设备的公共下载目录 Download/。\n\n'
+            '不点同意，对方什么也看不到。用完记得把开关关掉。',
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+            FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('开启')),
+          ],
+        ),
+      );
+      if (go != true || !mounted) return;
+    }
+    final c = await Native.setFileServer(v);
+    if (mounted) setState(() => _cfg = c);
+    if (!v) return;
+    // 地址要等原生那边真的 bind 上端口才有，晚一点再读一次
+    await Future.delayed(const Duration(milliseconds: 800));
+    await _load();
   }
 
   Future<void> _chooseChallengeType() async {
@@ -558,11 +639,17 @@ class _SettingsScreenState extends State<SettingsScreen>
     required String label,
     required void Function(int) onPreview,
     required Future<void> Function(int) onCommit,
+    String? subtitle,
   }) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        ListTile(dense: true, title: Text(title), trailing: Text(label)),
+        ListTile(
+          dense: true,
+          title: Text(title),
+          subtitle: subtitle == null ? null : Text(subtitle),
+          trailing: Text(label),
+        ),
         Slider(
           value: value.toDouble().clamp(min.toDouble(), max.toDouble()),
           min: min.toDouble(),
