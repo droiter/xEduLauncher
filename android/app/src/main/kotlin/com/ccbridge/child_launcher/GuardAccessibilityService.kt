@@ -68,6 +68,10 @@ class GuardAccessibilityService : AccessibilityService() {
     /** 上一个被放行的选择器包名：同一个包反复报窗口事件时日志只写一行 */
     private var lastPickerLogged: String? = null
 
+    /** 上一条「放行为什么」的键和时刻，见 [logThrottled] */
+    private var lastAllowKey: String? = null
+    private var lastAllowAt = 0L
+
     /** 屏幕顶部那行「本次剩余 m:ss」，没加上时为 null */
     private var overlay: TextView? = null
 
@@ -101,6 +105,7 @@ class GuardAccessibilityService : AccessibilityService() {
         instance = this
         addOverlay()
         Diag.log("guard", "前台守护服务已连接（无障碍）")
+        Audit.record(Audit.SERVICE, "前台守护", "无障碍服务已连接：开始拦非白名单应用、计时、看窗口链")
     }
 
     override fun onDestroy() {
@@ -112,6 +117,7 @@ class GuardAccessibilityService : AccessibilityService() {
         // 这条日志是「限时为什么又不生效」的答案所在：服务一没，单次计时、前台守护、
         // 任务键拦截、回到桌面挑战全都跟着停，而桌面上看不出来
         Diag.log("guard", "前台守护服务断开（限时/前台守护/任务键/回到桌面挑战随之全部失效）")
+        Audit.record(Audit.SERVICE, "前台守护", "无障碍服务断开：限时/前台守护/任务键/回到桌面挑战全部失效")
         super.onDestroy()
     }
 
@@ -178,7 +184,14 @@ class GuardAccessibilityService : AccessibilityService() {
         // 白名单应用自己的窗口除外：「recents / overview」是通用词，孩子的应用里也可能有
         // 这么命名的页面，照退就是把他正看着的界面按掉了（1.0.9 之前没这事——那时这条判断
         // 排在白名单之后，移到这里是为了堵住系统界面那条路，别顺手把孩子的应用也搭进去）
-        if (isTaskSwitchScreen(pkg, cls) && guardActive() && !childApp) {
+        if (isTaskSwitchScreen(pkg, cls) && !childApp) {
+            // 管控没在生效时这一屏退不掉，任务列表就留在屏幕上了——「按任务键有时候还能看到
+            // 任务列表」多半问的就是这一行。以前这里是静默 return，日志里查不到任何线索
+            val offTask = guardOffReason()
+            if (offTask != null) {
+                logThrottled(offTask, "任务键：这一屏本该退掉，但$offTask，只能放过")
+                return
+            }
             val now = SystemClock.elapsedRealtime()
             if (now - lastTaskKillAt >= TASK_KILL_GAP_MS) {
                 killTaskScreen(pkg, cls)
@@ -191,7 +204,19 @@ class GuardAccessibilityService : AccessibilityService() {
             return
         }
 
-        if (allowed(pkg, cls, ime, dialer)) return
+        // 管控没在生效的三种原因——以前这里（以及下面的白名单判断里）都是静默放行，
+        // 于是「该拦的应用没拦」在日志里一个字都找不到。现在把包名和原因一起记下来
+        val off = guardOffReason()
+        if (off != null) {
+            logThrottled(off, "放行 $pkg/${cls.substringAfterLast('.')}：$off")
+            return
+        }
+        // 本来就不该拦的：系统界面、输入法、拨号器、家长勾过的白名单应用
+        val routine = allowedReason(pkg, ime, dialer)
+        if (routine != null) {
+            logThrottled("$pkg|$routine", "放行 $pkg/${cls.substringAfterLast('.')}：$routine")
+            return
+        }
 
         val now = SystemClock.elapsedRealtime()
         if (now - lastBounceAt < BOUNCE_GAP_MS) {
@@ -201,9 +226,24 @@ class GuardAccessibilityService : AccessibilityService() {
         lastBounceAt = now
 
         Diag.log("guard", "拦截 $pkg/${cls.substringAfterLast('.')} → 回到桌面")
+        Audit.record(Audit.BOUNCE, pkg, "不在白名单，把孩子弹回桌面（${cls.substringAfterLast('.')}）")
         // 这一下回桌面是本服务干的，不是孩子按的 Home：桌面那边记下来，别再弹挑战框
         Store.noteGuardBounce(this)
         performGlobalAction(GLOBAL_ACTION_HOME)
+    }
+
+    /**
+     * 同一件事 10 秒内只记一条。窗口事件一秒能来好几条，而放行原因翻来覆去就那几种，
+     * 不节流的话 400 条的内存日志几分钟就被灌满，真正要看的现场反而被挤掉。
+     * [key] 是「同一件事」的判据：具体到包的原因用「包名|原因」，全局原因（守护关着之类）
+     * 直接用原因本身——它对每个包说的都是同一句话。
+     */
+    private fun logThrottled(key: String, msg: String) {
+        val now = SystemClock.elapsedRealtime()
+        if (key == lastAllowKey && now - lastAllowAt < ALLOW_LOG_GAP_MS) return
+        lastAllowKey = key
+        lastAllowAt = now
+        Diag.log("guard", msg)
     }
 
     /**
@@ -244,14 +284,25 @@ class GuardAccessibilityService : AccessibilityService() {
         return if (prev == launcherPkg) "" else prev
     }
 
-    /** 管控此刻是否真的在生效（开关开着、家长没在放行、本应用确实是默认桌面） */
-    private fun guardActive(): Boolean =
-        Store.frontGuard(this) && !Store.parentFreeActive(this) && Store.isDefaultLauncher(this)
+    /**
+     * 管控此刻**没**在生效的原因；生效时返回 null。
+     *
+     * 这三条以前都是静默 return true，日志里看不出任何痕迹——「该拦的应用没拦」「按任务键
+     * 还能看到任务列表」十有八九就撞在这上面（最常见的是无障碍被系统关掉、本应用没设成默认桌面，
+     * 家长在自检报告里只能看到一句「开关已打开」，看不出其实整体没生效）。
+     */
+    private fun guardOffReason(): String? {
+        if (!Store.frontGuard(this)) return "「前台守护」开关没打开"
+        if (Store.parentFreeActive(this)) return "家长放行期内（去过系统设置还没回来）"
+        if (!Store.isDefaultLauncher(this)) return "本应用不是系统默认桌面"
+        return null
+    }
 
     /** 退掉最近任务那一屏，让孩子留在当前应用里 */
     private fun killTaskScreen(pkg: String, cls: String) {
         lastTaskKillAt = SystemClock.elapsedRealtime()
         Diag.log("guard", "任务键：退掉 $pkg/${cls.substringAfterLast('.')}，留在当前应用")
+        Audit.record(Audit.TASK_KILL, pkg, "退掉「最近任务」那一屏（${cls.substringAfterLast('.')}），留在当前应用")
         performGlobalAction(GLOBAL_ACTION_BACK)
     }
 
@@ -338,17 +389,19 @@ class GuardAccessibilityService : AccessibilityService() {
     private fun isForeignApp(pkg: String, ime: Set<String>, dialer: String?): Boolean =
         pkg !in exempt && pkg !in ime && pkg != dialer && pkg !in otherHomeApps()
 
-    private fun allowed(pkg: String, cls: String, ime: Set<String>, dialer: String?): Boolean {
-        if (!Store.frontGuard(this)) return true
-        if (Store.parentFreeActive(this)) return true // 家长拿着第二个密码去系统设置办事
+    /**
+     * 「本来就不该拦」的原因，返回 null 表示该拦。（管控没生效那三条在 [guardOffReason] 里，
+     * 调用方要先问那个——顺序换了但结论不变：两条路都是放行，只是记下来的理由不一样。）
+     */
+    private fun allowedReason(pkg: String, ime: Set<String>, dialer: String?): String? {
         // 系统界面（状态栏、下拉通知栏、权限弹框、音量条）一律放行；
         // 其中的「最近任务」那一屏在上面就单独处理掉了，走不到这里
-        if (pkg in exempt) return true
-        if (pkg in ime) return true
+        if (pkg in exempt) return "系统界面"
+        if (pkg in ime) return "输入法"
         // 电话要放行：来电界面被弹回桌面，孩子就接不了电话了
-        if (pkg == dialer) return true
-        if (!Store.isDefaultLauncher(this)) return true // 还没被设为默认桌面，拦了就是死循环
-        return pkg in Store.allowed(this)
+        if (pkg == dialer) return "默认拨号器"
+        if (pkg in Store.allowed(this)) return "白名单应用"
+        return null
     }
 
     private fun defaultDialer(): String? = try {
@@ -376,6 +429,9 @@ class GuardAccessibilityService : AccessibilityService() {
     /** 正在等答案的那次会话（挑战页弹着的时候表是停的），null = 没有在弹 */
     private var challengeFor: String? = null
 
+    /** 上一次走表时屏幕是灭的。只在「灭→亮」「亮→灭」那一下写日志，不每秒刷 */
+    private var pausedByScreenOff = false
+
     private val sessionTick = object : Runnable {
         override fun run() {
             if (tickSession()) handler.postDelayed(this, 1000L)
@@ -388,6 +444,7 @@ class GuardAccessibilityService : AccessibilityService() {
         if (sessionPkg == pkg || challengeFor != null) return
         sessionPkg = pkg
         sessionSeconds = 0
+        pausedByScreenOff = false
         val limit = Store.singleUseMin(this)
         if (limit > 0) Diag.log("session", "$pkg 开始单次计时（上限 $limit 分钟）")
         arm()
@@ -399,6 +456,7 @@ class GuardAccessibilityService : AccessibilityService() {
         val used = sessionSeconds
         sessionPkg = null
         sessionSeconds = 0
+        pausedByScreenOff = false
         handler.removeCallbacks(sessionTick)
         Diag.log("session", "$pkg 的单次计时结束（$why），本次已用 ${used}s")
         updateOverlay()
@@ -433,9 +491,28 @@ class GuardAccessibilityService : AccessibilityService() {
             return false
         }
         val pm = getSystemService(POWER_SERVICE) as PowerManager
-        if (!pm.isInteractive) return true // 息屏不计时
+        if (!pm.isInteractive) {
+            // 息屏不计时，但要说清楚「是屏幕灭了所以没走表」，别让家长看着一串空档去猜
+            if (!pausedByScreenOff) {
+                pausedByScreenOff = true
+                Diag.log("session", "$pkg 的单次计时暂停：屏幕已熄灭（息屏不算使用）")
+            }
+            return true
+        }
+        if (pausedByScreenOff) {
+            pausedByScreenOff = false
+            Diag.log("session", "$pkg 的单次计时继续：屏幕已点亮，已用 ${sessionSeconds}s")
+        }
         sessionSeconds++
         updateOverlay()
+        // 心跳：家长拿不准「限时到底在不在走」时，日志里每 30 秒一行就是答案
+        if (sessionSeconds % TICK_LOG_EVERY_S == 0) {
+            Diag.log(
+                "session",
+                "$pkg 已连续使用 ${sessionSeconds}s / 上限 ${Store.singleUseMin(this) * 60}s" +
+                    "（前台应用窗口=${frontAppPkg ?: "（没记上）"}）",
+            )
+        }
         if (sessionSeconds >= Store.singleUseMin(this) * 60) {
             fireChallenge(pkg)
             return false
@@ -449,6 +526,7 @@ class GuardAccessibilityService : AccessibilityService() {
         challengeFor = pkg
         handler.removeCallbacks(sessionTick)
         Diag.log("session", "$pkg 连续用满 ${Store.singleUseMin(this)} 分钟 → 弹乘法挑战")
+        Audit.record(Audit.CHALLENGE, pkg, "单次用满 ${Store.singleUseMin(this)} 分钟，弹乘法挑战")
         updateOverlay()
         Store.showSessionChallenge(this, pkg)
     }
@@ -524,6 +602,7 @@ class GuardAccessibilityService : AccessibilityService() {
                     "已显示（走悬浮窗权限那条路）"
                 }
                 Diag.log("session", "顶部剩余时间浮层：$overlayNote")
+                Audit.record(Audit.OVERLAY, "", "加上屏幕顶部「本次剩余」小字：$overlayNote")
                 return
             } catch (e: Exception) {
                 overlayNote = "${e.javaClass.simpleName}: ${e.message}"
@@ -536,6 +615,7 @@ class GuardAccessibilityService : AccessibilityService() {
     private fun removeOverlay() {
         val tv = overlay ?: return
         overlay = null
+        Audit.record(Audit.OVERLAY, "", "移除屏幕顶部那行小字（服务要停了）")
         try {
             (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(tv)
         } catch (_: Exception) {
@@ -590,6 +670,12 @@ class GuardAccessibilityService : AccessibilityService() {
         /** 两次「退掉任务列表」之间的最小间隔：太密会把孩子应用里的返回键也一起按掉 */
         private const val TASK_KILL_GAP_MS = 700L
 
+        /** 同一条「放行/放过」日志的重复抑制窗口，见 logThrottled */
+        private const val ALLOW_LOG_GAP_MS = 10_000L
+
+        /** 单次计时走表时每隔多少秒留一行心跳，家长据此确认「表确实在走」 */
+        private const val TICK_LOG_EVERY_S = 30
+
         /**
          * 桌面露头多久之内还算「刚露头」。超过这个时长说明孩子已经在桌面上站着了，
          * 那一次露头的现场就不该再被翻出来用（他站在桌面上按 Home 也不该弹框）
@@ -612,6 +698,16 @@ class GuardAccessibilityService : AccessibilityService() {
 
         /** 桌面判「这一次露面要不要弹挑战框」的证据，见 [beforeLauncher] */
         fun beforeLauncher(launcherPkg: String): String? = instance?.windowBeforeLauncher(launcherPkg)
+
+        /**
+         * 自检报告里的一行：管控此刻到底在不在生效，不生效是被哪一条卡住的。
+         * 「限时没生效」「该拦的没拦」这类反馈，先看这一行——比逐个开关猜快得多。
+         */
+        fun guardStateText(ctx: Context): String {
+            val s = instance
+                ?: return "✗ 没生效：无障碍服务没在运行（限时、前台守护、任务键、回到桌面挑战全都停着）"
+            return s.guardOffReason()?.let { "✗ 没生效：$it" } ?: "✓ 生效中"
+        }
 
         /** 自检报告里那一小节：这一次露头的证据链，家长贴日志时能一眼看出判反在哪 */
         fun frontReport(ctx: Context): String {
@@ -656,12 +752,25 @@ class GuardAccessibilityService : AccessibilityService() {
                 }
             )
             sb.appendLine("正在等答题：${s.challengeFor ?: "无"}")
+            // 光看「view 不为 null」会说谎：会话一停这行小字就被藏起来（见 updateOverlay），
+            // 但 view 还在、文字还留着上一次的「本次剩余 9:41」，报告里就写成「现在挂着 9:41」
+            val tv = s.overlay
             sb.appendLine(
-                "屏幕顶部剩余时间小字：${s.overlayNote}；" +
-                    if (s.overlay == null) "现在没有" else "现在是「${s.overlay!!.text}」"
+                "屏幕顶部剩余时间小字：${s.overlayNote}；" + when {
+                    tv == null -> "现在没有"
+                    tv.visibility != View.VISIBLE ->
+                        "现在没显示（它里面还留着上次的字「${tv.text}」，没在会话里就收起来了）"
+                    else -> "现在是「${tv.text}」"
+                }
             )
             sb.appendLine("无障碍看到的当前前台：${Store.currentForeground(ctx) ?: "（还没记录）"}")
-            sb.appendLine("计时认的那个应用窗口：${s.frontAppPkg ?: "（还没记录）"}")
+            // 这个值只在会话里跟当前应用比着用（见 tickSession），会话一停就没人清它。
+            // 不写明白，报告里会出现「没在计时，却认着一个应用窗口」这种看着像 bug 的一行
+            val frontApp = s.frontAppPkg
+            sb.appendLine(
+                "计时认的那个应用窗口：${frontApp ?: "（还没记录）"}" +
+                    if (frontApp != null && s.sessionPkg == null) "（会话已结束，这个值是上一次留下的）" else ""
+            )
             return sb.toString()
         }
     }

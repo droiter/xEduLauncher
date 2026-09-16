@@ -45,6 +45,17 @@ class MainActivity : FlutterActivity() {
     /** 这一次露面是不是「按 Home 键」造成的（onNewIntent 记下，onResume 用掉） */
     private var viaHomeIntent = false
 
+    /**
+     * 上一次离开前台，是不是被本应用自己的**家长页面**（密码页、同意页）盖住的。
+     *
+     * 这两个页面一关，人就直接回到桌面，那不是「他从应用里逃回来」。光靠无障碍窗口链
+     * 看不出这件事：密码页一开就抢焦点，键盘（honeyboard 之类）跟着顶上来，链子上记的
+     * 是键盘——既不等于「本应用自己的页面」，也不在白名单里，于是兜底判据 leftFg
+     * （MainActivity 离开前台 >1.2 秒）就把他判成逃回桌面（2026-09-16 真机：输完密码
+     * 回桌面白弹一道乘法题，答错还会被送进两小时前用过的应用）。
+     */
+    private var coveredByOwnPage = false
+
     /** 本 Activity 此刻是否在前台。只作为判定的兜底依据之一 */
     private var inForeground = false
 
@@ -135,6 +146,10 @@ class MainActivity : FlutterActivity() {
             // 家长刚从系统设置那趟回来（放行还没收回）：这一下是他自己按的 Home，
             // 不该让他再做一道题，否则家长外出办事回来还得答题才能用桌面
             Store.parentFreeActive(this) -> false to "家长刚在放行期里（去过系统设置之类）"
+            // 这一下露面是本应用自己的家长页面（密码页/同意页）关掉造成的。要排在所有
+            // 兜底证据前面：兜底只看「Activity 离开前台多久」，而这两个页面必然把
+            // MainActivity 压下去好几秒，一关就成了「离开前台 >1.2 秒」的假证据
+            coveredByOwnPage -> false to "刚盖在上面的是本应用自己的家长页面（密码页/同意页）"
             // 「」= 无障碍看见桌面之前是本应用自己的页面（密码页/乘法挑战页/同意页盖在上面），
             // 那不是从应用里逃出来的——这条要排在兜底证据前面，否则锁屏页一关就误判成逃回桌面
             before != null && before.isEmpty() -> false to "刚才盖在上面的是本应用自己的页面"
@@ -152,12 +167,48 @@ class MainActivity : FlutterActivity() {
             "露面判定（${if (viaHome) "按 Home 键" else "没有 Home intent（按返回键退出应用之类）"}）：" +
                 "桌面最后在前 ${ago(now, self)}前、别的应用 ${ago(now, other)}前、" +
                 "桌面之前=${before ?: "（看不出）"}、leftScreen=${ago(now, leftScreen)}前、" +
-                "leftFg=${leftFg}ms、最前=$front → ${if (verdict.first) "弹挑战" else "不打扰"}",
+                "leftFg=${leftFg}ms、ownPage=$coveredByOwnPage、最前=$front → " +
+                "${if (verdict.first) "弹挑战" else "不打扰"}",
         )
         lastHomeDecision =
             "桌面这次露面：${verdict.second} → ${if (verdict.first) "弹挑战" else "不打扰"}"
+        // 判定要弹框才算「程序做了个动作」。不弹的那些不记进审计——它们本身就是「什么都没做」，
+        // 记进去会把审计列表灌满，反而看不出真正的动作。依据留在运行日志的 [home] 行里
+        if (verdict.first) {
+            Audit.record(Audit.CHALLENGE, "", "判定「他从应用里回到桌面」→ 弹挑战框（依据：${verdict.second}）")
+        }
         consumeHomeEvidence()
         return verdict
+    }
+
+    /**
+     * 把「该弹挑战框了」这件事通知 Flutter 侧。
+     *
+     * channel 为 null = Flutter 引擎还没起来（桌面刚被冷启动、界面还没挂上）。这一下以前是
+     * **静默丢掉**的：孩子按了键，屏幕上什么都不弹，日志里也查不到为什么——只能看到判定说
+     * 「弹挑战」，然后就没下文了。至少留一条，说清是谁把它吞掉的。
+     */
+    private fun notifyDart(method: String, what: String) {
+        val ch = channel
+        if (ch == null) {
+            Diag.log("home", "$what：Flutter 通道还没就绪，这一下通知丢了（界面不会弹框）")
+            return
+        }
+        ch.invokeMethod(method, null)
+    }
+
+    /**
+     * 家长改了什么配置：只列真的变了的项，一行写完。写进行为审计是因为这属于
+     * 「程序改了设备上的状态」，而且「白名单里某个应用怎么没了」这类疑问全靠这一行回答。
+     */
+    private fun logConfigChange(before: Map<String, Any>, after: Map<String, Any>) {
+        val skip = setOf("usedSeconds", "extraSeconds", "openCount", "fileServerUrl")
+        val changed = after.keys
+            .filter { it !in skip && before[it] != after[it] }
+            .joinToString("、") { "$it: ${before[it]} → ${after[it]}" }
+        if (changed.isEmpty()) return
+        Diag.log("cfg", "配置变更：$changed")
+        Audit.record(Audit.CONFIG, "", changed)
     }
 
     /**
@@ -170,6 +221,7 @@ class MainActivity : FlutterActivity() {
     private fun consumeHomeEvidence() {
         leftScreenAt = 0L
         leftForegroundAt = 0L
+        coveredByOwnPage = false
         Store.noteForeground(this, packageName, countAsApp = false)
     }
 
@@ -199,8 +251,8 @@ class MainActivity : FlutterActivity() {
         if (escape != null && escape.first) {
             // 从别处逃回桌面。按 Home 的那次走 onHomeKey（老路），
             // 按返回键退出应用的那次系统连 intent 都不发，走 onBackEscape
-            if (viaHome) channel?.invokeMethod("onHomeKey", null)
-            else channel?.invokeMethod("onBackEscape", null)
+            if (viaHome) notifyDart("onHomeKey", "按 Home 键从应用回到桌面")
+            else notifyDart("onBackEscape", "按返回键退出应用回到桌面")
         }
         val nowDefault = Store.isDefaultLauncher(this)
         if (nowDefault != lastDefault) {
@@ -229,6 +281,10 @@ class MainActivity : FlutterActivity() {
     override fun onPause() {
         inForeground = false
         leftForegroundAt = SystemClock.elapsedRealtime()
+        // 盖上来的是本应用自己的家长页面（密码页/同意页）吗？是的话这一次离开前台不算
+        // 「他离开桌面去了别处」，见 coveredByOwnPage。**不包含乘法挑战页**：那一页是从
+        // 孩子正在用的应用上弹出来的，它上面的 Home 就是「从应用里逃回来」，照旧要判
+        coveredByOwnPage = LockActivity.showing || HttpConsentActivity.showing
         // 桌面要离开前台了：下一次回到最前面算一次新露面，得重新判（见 judgeAppearance）。
         // 孩子站在桌面上按 Home 不经过这里，所以那一下不会被当成一次新露面
         appearanceJudged = false
@@ -332,10 +388,13 @@ class MainActivity : FlutterActivity() {
             }
             @Suppress("UNCHECKED_CAST")
             "updateConfig" -> {
+                val before = Store.configMap(this)
                 Store.applyConfig(this, args as Map<String, Any?>)
                 applyGuardState()
                 applyFileServer()
-                result.success(Store.configMap(this))
+                val after = Store.configMap(this)
+                result.success(after)
+                logConfigChange(before, after)
             }
             "listApps" -> result.success(listApps())
             @Suppress("UNCHECKED_CAST")
@@ -345,6 +404,7 @@ class MainActivity : FlutterActivity() {
             "openHomeSettings" -> result.success(requestDefaultHome())
             "launcherDiag" -> {
                 Diag.log("diag", "家长打开了桌面自检")
+                Audit.record(Audit.REPORT, "", "生成桌面自检报告（含行为审计）并存成文件")
                 result.success(launcherDiag())
             }
             "openSystemSettings" -> {
@@ -392,16 +452,23 @@ class MainActivity : FlutterActivity() {
             "resetStats" -> {
                 Store.resetStats(this)
                 result.success(Store.configMap(this))
+                Audit.record(Audit.CONFIG, "", "家长清空了今日统计（已用时长/次数归零）")
             }
             "setGuard" -> {
+                val before = Store.configMap(this)
                 Store.applyConfig(this, mapOf("guardEnabled" to (args as Boolean)))
                 applyGuardState()
-                result.success(Store.configMap(this))
+                val after = Store.configMap(this)
+                result.success(after)
+                logConfigChange(before, after)
             }
             "setFileServer" -> {
+                val before = Store.configMap(this)
                 Store.applyConfig(this, mapOf("fileServerOn" to (args as Boolean)))
                 applyFileServer()
-                result.success(Store.configMap(this))
+                val after = Store.configMap(this)
+                result.success(after)
+                logConfigChange(before, after)
             }
             // Dart 侧的关键决策也写进同一份日志文件，事后一起下载下来看
             "diagLog" -> {
@@ -420,10 +487,12 @@ class MainActivity : FlutterActivity() {
     private fun leaveLauncherFor(intent: Intent, what: String) {
         Store.grantParentFree(this)
         Diag.log("act", "家长外出去$what，前台守护暂让路")
+        Audit.record(Audit.SYSTEM, what, "家长离开桌面前去这个系统页面（前台守护暂让路）")
         try {
             startActivity(intent)
         } catch (e: Exception) {
             Diag.log("act", "打开$what 失败：${e.javaClass.simpleName}: ${e.message}")
+            Audit.record(Audit.SYSTEM, what, "打不开：${e.javaClass.simpleName}: ${e.message}")
         }
     }
 
@@ -431,8 +500,10 @@ class MainActivity : FlutterActivity() {
         val i = Intent(this, GuardService::class.java)
         if (Store.guardEnabled(this)) {
             ContextCompat.startForegroundService(this, i)
+            Audit.record(Audit.SERVICE, "计时守护", "拉起前台服务（每日时长统计/超时锁屏）")
         } else {
             stopService(i)
+            Audit.record(Audit.SERVICE, "计时守护", "停掉前台服务")
         }
     }
 
@@ -442,8 +513,10 @@ class MainActivity : FlutterActivity() {
         if (Store.fileServerOn(this)) {
             try {
                 ContextCompat.startForegroundService(this, i)
+                Audit.record(Audit.SERVICE, "文件传输", "拉起前台服务（等浏览器连过来）")
             } catch (e: Exception) {
                 Diag.log("http", "拉起文件传输服务失败：${e.javaClass.simpleName}: ${e.message}")
+                Audit.record(Audit.SERVICE, "文件传输", "拉不起来：${e.javaClass.simpleName}: ${e.message}")
             }
         } else {
             stopService(i)
@@ -496,8 +569,11 @@ class MainActivity : FlutterActivity() {
         val i = packageManager.getLaunchIntentForPackage(pkg) ?: return false
         i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
         return try {
-            startActivity(i); true
-        } catch (_: Exception) {
+            startActivity(i)
+            Audit.record(Audit.LAUNCH, pkg, "从桌面打开这个应用（挑战已通过）")
+            true
+        } catch (e: Exception) {
+            Diag.log("act", "打开 $pkg 失败：${e.javaClass.simpleName}: ${e.message}")
             false
         }
     }
@@ -527,6 +603,7 @@ class MainActivity : FlutterActivity() {
         return try {
             startActivity(i)
             Diag.log("home", "挑战没过，把孩子送回 $pkg")
+            Audit.record(Audit.RETURN, pkg, "挑战没过，把孩子送回去接着用（不带 RESET_TASK）")
             true
         } catch (e: Exception) {
             Diag.log("home", "送回 $pkg 失败：${e.javaClass.simpleName}: ${e.message}")
@@ -736,6 +813,7 @@ class MainActivity : FlutterActivity() {
         sb.appendLine("上次「默认桌面」尝试：${lastHomeOutcome ?: "（本次运行还没点过）"}")
         sb.appendLine()
         sb.appendLine("── 前台守护（拦非白名单应用 + 拒绝任务键）──")
+        sb.appendLine("管控此刻在生效吗：${GuardAccessibilityService.guardStateText(this)}")
         sb.appendLine("开关已打开：${Store.frontGuard(this)}")
         sb.appendLine("无障碍服务已在系统里启用：${Store.accessibilityOn(this)}")
         sb.appendLine("家长放行中（暂不拦截）：${Store.parentFreeActive(this)}")
@@ -773,6 +851,9 @@ class MainActivity : FlutterActivity() {
         sb.appendLine("── 文件传输（浏览器连本机下载日志 / 上传文件）──")
         sb.append(HttpGateway.report(this))
         sb.appendLine()
+        sb.appendLine("── 行为审计（程序对这台设备做过的每个动作）──")
+        sb.append(Audit.report(this))
+        sb.appendLine()
         sb.appendLine("── 运行日志（共 ${Diag.size()} 条，从旧到新）──")
         sb.append(Diag.dump())
 
@@ -783,6 +864,7 @@ class MainActivity : FlutterActivity() {
         return text +
             "\n\n═══ 这一份已存成文件 ═══\n${saved.absolutePath}\n" +
             "运行日志同时追加在：${Diag.logFile(this).absolutePath}\n" +
+            "行为审计同时追加在：${Audit.file(this).absolutePath}\n" +
             "在「文件传输」里用浏览器打开 ${HttpGateway.urlOrEmpty(this).ifEmpty { "（服务还没开）" }} 就能下载。\n"
     }
 

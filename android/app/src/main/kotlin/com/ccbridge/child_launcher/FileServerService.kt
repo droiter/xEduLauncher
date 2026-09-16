@@ -33,6 +33,7 @@ class FileServerService : Service() {
         }
         if (!HttpGateway.isRunning() && !HttpGateway.start(this)) {
             Diag.log("http", "服务起不来（端口被占），停掉前台服务")
+            Audit.record(Audit.SERVICE, "文件传输", "服务起不来（${Store.DEFAULT_FILE_PORT} 起 10 个端口全被占），已停掉")
             stopForegroundCompat()
             stopSelf()
             return START_NOT_STICKY

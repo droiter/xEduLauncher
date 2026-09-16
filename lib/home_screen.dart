@@ -32,7 +32,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     Native.backEscape.addListener(_onBackEscape);
     _reload().then((_) async {
       final cfg = _cfg;
-      if (cfg == null || !cfg.coldStartHome || !cfg.chOnHome) return;
+      if (cfg == null) return;
+      // 界面这一侧也留一条：原生日志只能说明「Activity 起来了」，
+      // 说明不了「Flutter 界面拿到了配置、磁贴画出来了」
+      Native.log(
+        '桌面界面就绪：白名单 ${cfg.allowed.length} 个应用、'
+        '回到桌面挑战=${cfg.chOnHome ? "开" : "关"}、'
+        '单次上限=${cfg.singleUseMin <= 0 ? "不限" : "${cfg.singleUseMin} 分钟"}',
+      );
+      if (!cfg.coldStartHome || !cfg.chOnHome) return;
       // 冷启动这次是「从别处按 Home 把桌面拉起来」，判据在原生侧，这里只负责弹
       Native.log('冷启动：原生判定为「从别处回到桌面」，弹挑战框');
       if (await _runChallenge('欢迎回来')) return;
@@ -123,6 +131,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _launch(InstalledApp app) async {
     final cfg = _cfg!;
+    Native.log('点了磁贴「${app.label}」（${app.package}）');
     // 家长在「应用白名单」里把这个应用设成免挑战时，直接打开
     if (cfg.needsChallenge(app.package) &&
         !await _runChallenge('准备打开「${app.label}」')) {

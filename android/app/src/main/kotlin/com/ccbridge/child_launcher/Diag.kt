@@ -42,6 +42,10 @@ object Diag {
 
     fun attach(ctx: Context) {
         app = ctx.applicationContext
+        // 行为审计和运行日志共用同一个 application context。接在这一处就够了：
+        // 全项目只在 Activity/Service/Receiver 起来时调 Diag.attach，两处一起接上，
+        // 免得将来新增一个服务只接了 Diag、审计文件却从这一刻起断在那
+        Audit.attach(ctx)
     }
 
     @Synchronized

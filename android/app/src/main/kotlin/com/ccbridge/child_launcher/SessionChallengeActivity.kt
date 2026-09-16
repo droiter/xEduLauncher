@@ -48,6 +48,7 @@ class SessionChallengeActivity : Activity() {
     /** 答对：会话清零重新计时，finish 后底下的应用自然回到前台，孩子接着用 */
     private fun pass(pkg: String) {
         Diag.log("session", "$pkg 的乘法挑战答对，单次时长清零重新计")
+        Audit.record(Audit.CHALLENGE, pkg, "乘法答对 → 单次时长清零，孩子留在原应用接着用")
         GuardAccessibilityService.onChallengeAnswered(true)
         showing = false
         finish()
@@ -56,6 +57,7 @@ class SessionChallengeActivity : Activity() {
     /** 答错：没通过，送回桌面，这一次不能再用了 */
     private fun deny(pkg: String) {
         Diag.log("session", "$pkg 的乘法挑战答错，送回儿童桌面")
+        Audit.record(Audit.HOME, pkg, "乘法答错 → 把孩子送回儿童桌面，这次不能再用")
         GuardAccessibilityService.onChallengeAnswered(false)
         Store.noteGuardBounce(this) // 这一下回桌面是本应用弹的，别再让孩子做一道按 Home 的题
         val home = Intent(Intent.ACTION_MAIN)
@@ -65,6 +67,7 @@ class SessionChallengeActivity : Activity() {
             startActivity(home)
         } catch (e: Exception) {
             Diag.log("session", "送回桌面失败：${e.javaClass.simpleName}: ${e.message}")
+            Audit.record(Audit.HOME, pkg, "送回桌面失败：${e.javaClass.simpleName}: ${e.message}")
         }
         showing = false
         finish()

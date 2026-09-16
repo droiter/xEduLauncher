@@ -207,8 +207,12 @@ object Store {
             .putExtra(LockActivity.EXTRA_REASON, reason)
         try {
             ctx.startActivity(i)
-        } catch (_: Exception) {
-            // 无悬浮窗权限时后台启动 Activity 会被系统拦截，忽略即可
+            Audit.record(Audit.LOCK, reason, "拉起密码页（${if (reason == "count") "打开次数用完" else "今日时长用完"}）")
+        } catch (e: Exception) {
+            // 无悬浮窗权限时后台启动 Activity 会被系统拦截。以前这里什么都不留，
+            // 家长看到的就是「该锁屏的时候什么都没发生」——记下来才查得到
+            Diag.log("gate", "拉起密码页失败（$reason）：${e.javaClass.simpleName}: ${e.message}")
+            Audit.record(Audit.LOCK, reason, "密码页拉不起来（多半是没给「显示在其他应用上层」权限）：${e.javaClass.simpleName}")
         }
     }
 
@@ -223,6 +227,7 @@ object Store {
         } catch (e: Exception) {
             // 后台启动 Activity 需要悬浮窗权限，没有的话只能放弃这一次挑战（计时已停，不会再连环弹）
             Diag.log("session", "弹乘法挑战页失败：${e.javaClass.simpleName}: ${e.message}")
+            Audit.record(Audit.CHALLENGE, pkg, "乘法挑战页拉不起来：${e.javaClass.simpleName}（多半是没给悬浮窗权限）")
         }
     }
 
@@ -296,6 +301,7 @@ object Store {
     fun approveIp(ctx: Context, ip: String) {
         p(ctx).edit().putStringSet(K_APPROVED_IPS, approvedIps(ctx) + ip).apply()
         Diag.log("http", "家长同意了 $ip 的连接")
+        Audit.record(Audit.HTTP, ip, "家长点了「同意」，这台设备此后可以下载日志、上传文件")
     }
 
     fun revokeIps(ctx: Context) {
@@ -317,12 +323,14 @@ object Store {
         val until = SystemClock.elapsedRealtime() + settingsFreeMin(ctx) * 60_000L
         p(ctx).edit().putLong(K_PARENT_FREE_UNTIL, until).apply()
         Diag.log("guard", "家长放行开始，${settingsFreeMin(ctx)} 分钟内不拦截前台应用")
+        Audit.record(Audit.FREE, "", "开始放行 ${settingsFreeMin(ctx)} 分钟（这段时间不拦任何应用）")
     }
 
     fun clearParentFree(ctx: Context) {
         if (p(ctx).getLong(K_PARENT_FREE_UNTIL, 0L) != 0L) {
             p(ctx).edit().putLong(K_PARENT_FREE_UNTIL, 0L).apply()
             Diag.log("guard", "家长放行结束")
+            Audit.record(Audit.FREE, "", "放行结束（家长回到桌面），恢复拦截")
         }
     }
 

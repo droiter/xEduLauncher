@@ -141,6 +141,7 @@ object HttpGateway {
             acceptThread = t
             t.start()
             Diag.log("http", "文件传输服务已启动：${urls(ctx).joinToString(" / ")}，根目录 ${Store.filesRoot(ctx)}")
+            Audit.record(Audit.SERVICE, "文件传输", "服务已启动，监听 ${urls(ctx).joinToString(" / ")}（每台新设备都要在设备上点同意）")
             return true
         }
     }
@@ -157,6 +158,7 @@ object HttpGateway {
             pendingIp = null
             consentShownFor = null
             Diag.log("http", "文件传输服务已停止")
+            Audit.record(Audit.SERVICE, "文件传输", "服务已停止（已同意的设备名单一并清空）")
         }
     }
 
@@ -201,6 +203,7 @@ object HttpGateway {
         deniedAt = SystemClock.elapsedRealtime()
         pendingIp = null
         Diag.log("http", "家长拒绝了 $ip 的连接")
+        Audit.record(Audit.HTTP, ip, "家长点了「拒绝」，这台设备看不了也用不了（60 秒内不再弹框）")
     }
 
     /** 这台设备已被同意过吗；没同意就顺手把同意页拉起来，并返回 false */
@@ -214,6 +217,7 @@ object HttpGateway {
             pendingAt = SystemClock.elapsedRealtime()
             consentShownFor = null
             Diag.log("http", "$ip 请求连接，等家长在设备上确认")
+            Audit.record(Audit.HTTP, ip, "有设备连过来（浏览器打开了地址），等家长在设备上点同意")
         }
         askConsent(ctx, ip, force = false)
         return false
@@ -272,9 +276,9 @@ object HttpGateway {
 
         when {
             path == "/" || path == "/index.html" -> listPage(ctx, out, query["d"].orEmpty())
-            path == "/f" -> download(ctx, req, out, query["p"].orEmpty())
-            path == "/pub" -> downloadPublic(ctx, req, out, query["n"].orEmpty())
-            path == "/up" && req.method == "POST" -> upload(ctx, req, br, out)
+            path == "/f" -> download(ctx, req, out, query["p"].orEmpty(), ip)
+            path == "/pub" -> downloadPublic(ctx, req, out, query["n"].orEmpty(), ip)
+            path == "/up" && req.method == "POST" -> upload(ctx, req, br, out, ip)
             else -> page(out, 404, "没这个地址")
         }
     }
@@ -354,7 +358,7 @@ object HttpGateway {
         page(out, html(sb.toString()))
     }
 
-    private fun download(ctx: Context, req: Req, out: OutputStream, rel: String) {
+    private fun download(ctx: Context, req: Req, out: OutputStream, rel: String, ip: String) {
         val root = Store.filesRoot(ctx)
         val f = resolve(root, rel)
         if (f == null || !f.isFile) {
@@ -410,6 +414,9 @@ object HttpGateway {
             out.flush()
             return
         }
+        // 记在这一步而不是传完之后：客户端中途断线会抛异常，那样就只在日志里留个错、
+        // 审计里干干净净，看着像「没人取过这个文件」
+        Audit.record(Audit.FILE, rel, "把私有目录里的文件交给 $ip 下载（${size(len)}）")
         FileInputStream(f).use { fis ->
             fis.skip(start)
             val buf = ByteArray(64 * 1024)
@@ -426,7 +433,7 @@ object HttpGateway {
 
     // ---------- 上传 ----------
 
-    private fun upload(ctx: Context, req: Req, ins: BackReader, out: OutputStream) {
+    private fun upload(ctx: Context, req: Req, ins: BackReader, out: OutputStream, ip: String) {
         // 上传不认「家长当前浏览到哪一层」，一律落到设备的公共下载目录（见 [PublicDownloads]）。
         // back 只决定传完之后把家长送回哪一页。
         val back = parseQuery(req.target.substringAfter('?', ""))["back"].orEmpty()
@@ -475,6 +482,7 @@ object HttpGateway {
                     PublicDownloads.finish(ctx, pub)
                     publicSaved.add(pub.name)
                     Diag.log("http", "收到文件 ${pub.name} → 公共下载目录 Download/")
+                    Audit.record(Audit.FILE, pub.name, "$ip 上传的文件落进设备的公共下载目录 Download/")
                 } else {
                     PublicDownloads.abort(ctx, pub)
                 }
@@ -500,6 +508,10 @@ object HttpGateway {
                     if (tmp.renameTo(target)) {
                         privateSaved.add(target.name)
                         Diag.log("http", "收到文件 ${target.name}（${size(target.length())}）→ 私有 uploads/")
+                        Audit.record(
+                            Audit.FILE, target.name,
+                            "$ip 上传的文件落进应用私有目录 uploads/（${size(target.length())}，别的应用看不到）",
+                        )
                     } else {
                         tmp.delete()
                     }
@@ -537,7 +549,7 @@ object HttpGateway {
     }
 
     /** 下载公共下载目录里本应用上传上去的文件，Range 分片照旧支持 */
-    private fun downloadPublic(ctx: Context, req: Req, out: OutputStream, name: String) {
+    private fun downloadPublic(ctx: Context, req: Req, out: OutputStream, name: String, ip: String) {
         val row = PublicDownloads.list(ctx).firstOrNull { it.name == name }
         val stream = PublicDownloads.open(ctx, name)
         if (row == null || stream == null) {
@@ -590,6 +602,7 @@ object HttpGateway {
             out.flush()
             return
         }
+        Audit.record(Audit.FILE, name, "把 Download/ 里的文件交给 $ip 下载（${size(len)}）")
         stream.use { s ->
             var left2skip = start
             while (left2skip > 0) {
@@ -1057,6 +1070,7 @@ object HttpGateway {
         sb.appendLine("访问地址：${urls(ctx).joinToString(" / ").ifEmpty { "（未启动）" }}")
         sb.appendLine("根目录：${Store.filesRoot(ctx)}")
         sb.appendLine("日志文件：${Diag.logFile(ctx)}")
+        sb.appendLine("行为审计文件：${Audit.file(ctx)}（连上浏览器后在 logs/ 里点它就能下载）")
         sb.appendLine(
             "上传落点：" + if (PublicDownloads.available()) {
                 "设备的公共下载目录 Download/（其他应用也能看到），已上传 ${PublicDownloads.list(ctx).size} 个"

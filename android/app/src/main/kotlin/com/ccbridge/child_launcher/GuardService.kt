@@ -41,6 +41,8 @@ class GuardService : Service() {
         startForegroundCompat()
         running = true
         handler.postDelayed(tick, 1000L)
+        Diag.log("gate", "计时守护服务已启动（每日用量统计 / 到点拉密码页）")
+        Audit.record(Audit.SERVICE, "计时守护", "服务已启动，开始统计每日时长/次数")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
@@ -48,6 +50,8 @@ class GuardService : Service() {
     override fun onDestroy() {
         running = false
         handler.removeCallbacks(tick)
+        Diag.log("gate", "计时守护服务已停止（每日用量不再统计、到点也不锁屏）")
+        Audit.record(Audit.SERVICE, "计时守护", "服务已停止：每日用量不再统计、到点不锁屏")
         super.onDestroy()
     }
 
