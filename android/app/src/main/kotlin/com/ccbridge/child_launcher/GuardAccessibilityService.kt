@@ -51,6 +51,13 @@ class GuardAccessibilityService : AccessibilityService() {
      */
     private var lastTaskKillAt = 0L
 
+    /**
+     * 上一次「退掉最近任务那一屏」时孩子正在用的应用，以及那一刻。桌面那边用
+     * [takeTaskReturn] 取走：三星手势导航下退掉多任务视图会落到桌面上，那一下不是他想回桌面。
+     */
+    private var taskReturnPkg: String? = null
+    private var taskReturnAt = 0L
+
     /** 系统界面里必须放行的部分：状态栏/通知面板、权限弹框、系统本身 */
     private val exempt = setOf(
         "android",
@@ -176,7 +183,7 @@ class GuardAccessibilityService : AccessibilityService() {
         if (childApp) {
             startSession(pkg)
         } else if (foreign) {
-            endSession("切到了 $pkg")
+            pauseSession("切到了 $pkg")
         }
 
         // 「最近任务」优先处理，而且不跟下面那条防连环弹的节流共用计数器（见 lastTaskKillAt）。
@@ -187,7 +194,7 @@ class GuardAccessibilityService : AccessibilityService() {
         if (isTaskSwitchScreen(pkg, cls) && !childApp) {
             // 管控没在生效时这一屏退不掉，任务列表就留在屏幕上了——「按任务键有时候还能看到
             // 任务列表」多半问的就是这一行。以前这里是静默 return，日志里查不到任何线索
-            val offTask = guardOffReason()
+            val offTask = taskKillOffReason()
             if (offTask != null) {
                 logThrottled(offTask, "任务键：这一屏本该退掉，但$offTask，只能放过")
                 return
@@ -298,12 +305,42 @@ class GuardAccessibilityService : AccessibilityService() {
         return null
     }
 
+    /**
+     * 「退掉最近任务那一屏」这件事没在生效的原因。**故意不问「是不是默认桌面」**：
+     * 退那一屏发的是返回键，谁当桌面都成立——本应用没被设成默认桌面时，孩子照样不该看到
+     * 任务列表。2026-09-16 的真机日志里，那条判据翻车时任务列表被白白放过了 7 个多小时
+     * （日志原话：「任务键：这一屏本该退掉，但本应用不是系统默认桌面，只能放过」）。
+     * 拦截非白名单应用那条路仍然要默认桌面，见 [guardOffReason]。
+     */
+    private fun taskKillOffReason(): String? {
+        if (!Store.frontGuard(this)) return "「前台守护」开关没打开"
+        if (Store.parentFreeActive(this)) return "家长放行期内（去过系统设置还没回来）"
+        return null
+    }
+
     /** 退掉最近任务那一屏，让孩子留在当前应用里 */
     private fun killTaskScreen(pkg: String, cls: String) {
         lastTaskKillAt = SystemClock.elapsedRealtime()
+        // 三星手势导航下，从多任务视图按返回会落到桌面上（不是回到原来那个应用）——桌面那一次
+        // 露面就是这么来的。记下他本该待在哪个应用里，桌面那边看到这次的记录就把他送回去
+        // （见 consumeTaskReturn / MainActivity.onResume），不弹挑战框。
+        // 认的是**会话**里那个应用，不是「最后一个应用窗口」：孩子站在桌面上按任务键时，
+        // 会话已经停了（sessionPkg=null），那时就不该把他送进昨天用过的应用里
+        taskReturnPkg = sessionPkg?.takeIf { it in Store.allowed(this) }
+        taskReturnAt = SystemClock.elapsedRealtime()
         Diag.log("guard", "任务键：退掉 $pkg/${cls.substringAfterLast('.')}，留在当前应用")
         Audit.record(Audit.TASK_KILL, pkg, "退掉「最近任务」那一屏（${cls.substringAfterLast('.')}），留在当前应用")
         performGlobalAction(GLOBAL_ACTION_BACK)
+    }
+
+    /**
+     * 「退掉最近任务」之后那一下露面该把孩子送回哪个应用。**只认刚退掉那一两秒内的记录**：
+     * 时间一过就当没有，免得他后来自己按 Home 也被送回应用里。
+     */
+    private fun takeTaskReturn(): String? {
+        val pkg = taskReturnPkg ?: return null
+        taskReturnPkg = null
+        return if (SystemClock.elapsedRealtime() - taskReturnAt <= TASK_RETURN_WINDOW_MS) pkg else null
     }
 
     private fun isRecentsClass(cls: String): Boolean {
@@ -438,27 +475,53 @@ class GuardAccessibilityService : AccessibilityService() {
         }
     }
 
-    /** 孩子打开了 [pkg]（或从别处切回来）：会话切到它，从 0 开始数 */
+    /** 孩子打开了 [pkg]（或从别处切回来）：会话切到它，接着上一次用剩下的时间往下数 */
     private fun startSession(pkg: String) {
+        // 挑战页其实已经不在屏幕上了（被系统回收/进程走过一遭）：把「在等答题」这个标记清掉，
+        // 否则它会一直卡着，之后所有应用的计时都起不来
+        if (challengeFor != null && !SessionChallengeActivity.showing) challengeFor = null
         // 挑战页还弹着的时候不去碰会话：底下那个应用这时也可能冒窗口事件
         if (sessionPkg == pkg || challengeFor != null) return
-        sessionPkg = pkg
-        sessionSeconds = 0
-        pausedByScreenOff = false
+        // 直接从别的应用切过来的：把上一个应用的表停在这一刻（剩余保留）
+        if (sessionPkg != null) pauseSession("切到了 $pkg")
         val limit = Store.singleUseMin(this)
-        if (limit > 0) Diag.log("session", "$pkg 开始单次计时（上限 $limit 分钟）")
+        sessionPkg = pkg
+        sessionSeconds = Store.sessionUsed(this, pkg)
+        pausedByScreenOff = false
+        // 这一次的额度上次就用光了（在题上没答对）：别给他从头数的机会，进来就把题再弹出来
+        if (limit > 0 && sessionSeconds >= limit * 60) {
+            Diag.log("session", "$pkg 这次的时长已经用光，一进来就弹题")
+            fireChallenge(pkg)
+            return
+        }
+        if (limit > 0) {
+            Diag.log(
+                "session",
+                "$pkg 开始单次计时（上限 $limit 分钟，接着上次剩的 ${limit * 60 - sessionSeconds} 秒）",
+            )
+        }
         arm()
         updateOverlay()
     }
 
-    private fun endSession(why: String) {
+    /**
+     * 孩子离开了这个应用（切到别的应用、回桌面、被密码页盖住）：**停表，但不作废**——
+     * 已经用掉的秒数存起来，他再进来接着用剩下的。只有答对乘法题才清零重新给满，见 [answerChallenge]。
+     * 2026-09-16 owner 反馈「切到后台再返回，剩余时间又复原了，限时等于没用」之后改成这样的。
+     */
+    private fun pauseSession(why: String) {
         val pkg = sessionPkg ?: return
         val used = sessionSeconds
+        Store.setSessionUsed(this, pkg, used)
         sessionPkg = null
         sessionSeconds = 0
         pausedByScreenOff = false
         handler.removeCallbacks(sessionTick)
-        Diag.log("session", "$pkg 的单次计时结束（$why），本次已用 ${used}s")
+        val left = (Store.singleUseMin(this) * 60 - used).coerceAtLeast(0)
+        Diag.log(
+            "session",
+            "$pkg 的单次计时暂停（$why），已用 ${used}s、还剩 ${left}s（再进来接着用）",
+        )
         updateOverlay()
     }
 
@@ -477,17 +540,17 @@ class GuardAccessibilityService : AccessibilityService() {
     private fun tickSession(): Boolean {
         val pkg = sessionPkg ?: return false
         if (Store.singleUseMin(this) <= 0) {
-            endSession("家长把上限改成了不限")
+            pauseSession("家长把上限改成了不限")
             return false
         }
         // 只有前台换成了**别的应用**才算他离开了这个应用。输入法弹出来、状态栏拉开、桌面
-        // 自己弹个框、任务键那一屏——这些也都是窗口事件，但都不是换应用，不该把他的计时清零。
+        // 自己弹个框、任务键那一屏——这些也都是窗口事件，但都不是换应用，不该动他的表。
         // 1.0.10 真机上就是这么一秒一断（日志里 xedu 每段计时只有 0~11 秒），
-        // 于是 5 分钟的上限永远攒不满，这个功能等于没生效。
+        // 于是上限永远攒不满，这个功能等于没生效。
         // 「回了桌面」那条路由 MainActivity.onResume → onDesktopShown 管，不靠这里。
         val frontApp = frontAppPkg
         if (frontApp != null && frontApp != pkg) {
-            endSession("前台换成了 $frontApp")
+            pauseSession("前台换成了 $frontApp")
             return false
         }
         val pm = getSystemService(POWER_SERVICE) as PowerManager
@@ -504,6 +567,8 @@ class GuardAccessibilityService : AccessibilityService() {
             Diag.log("session", "$pkg 的单次计时继续：屏幕已点亮，已用 ${sessionSeconds}s")
         }
         sessionSeconds++
+        // 每几秒落一次盘：孩子在题上走开、或者进程被系统杀掉时，已用的时间不会白送回去
+        if (sessionSeconds % PERSIST_EVERY_S == 0) Store.setSessionUsed(this, pkg, sessionSeconds)
         updateOverlay()
         // 心跳：家长拿不准「限时到底在不在走」时，日志里每 30 秒一行就是答案
         if (sessionSeconds % TICK_LOG_EVERY_S == 0) {
@@ -522,28 +587,38 @@ class GuardAccessibilityService : AccessibilityService() {
 
     /** 到点：停表，弹一道一位数乘法。结局由挑战页回报，见 [answerChallenge] */
     private fun fireChallenge(pkg: String) {
-        sessionSeconds = 0 // 先清零：答对就是从这里重新开始数
+        val limit = Store.singleUseMin(this)
+        // 「这次已经用满」先落盘：孩子在题上按 Home 走开（或进程被杀）时，
+        // 再进来还得是没额度，而不是白捡一整轮
+        if (limit > 0) Store.setSessionUsed(this, pkg, limit * 60)
         challengeFor = pkg
         handler.removeCallbacks(sessionTick)
-        Diag.log("session", "$pkg 连续用满 ${Store.singleUseMin(this)} 分钟 → 弹乘法挑战")
-        Audit.record(Audit.CHALLENGE, pkg, "单次用满 ${Store.singleUseMin(this)} 分钟，弹乘法挑战")
+        Diag.log("session", "$pkg 连续用满 $limit 分钟 → 弹乘法挑战")
+        Audit.record(Audit.CHALLENGE, pkg, "单次用满 $limit 分钟，弹乘法挑战")
         updateOverlay()
         Store.showSessionChallenge(this, pkg)
     }
 
-    /** 挑战页的结局：答对＝原应用从 0 重新计时，孩子接着用；答错＝会话就此结束（人已被送回桌面） */
+    /**
+     * 挑战页的结局：答对＝把这个应用的时长清零（重新给满），孩子接着用；
+     * 答错＝这一次的额度就算用光了，他人已被送回桌面，再点开这个应用会立刻再弹同一道题。
+     */
     private fun answerChallenge(ok: Boolean) {
         val pkg = challengeFor ?: return
         challengeFor = null
         if (ok) {
+            Store.clearSessionUsed(this, pkg)
             sessionPkg = pkg
             sessionSeconds = 0
-            Diag.log("session", "$pkg 挑战答对，单次时长清零重新计时")
+            Diag.log("session", "$pkg 挑战答对，单次时长清零重新计时（重新给满 ${Store.singleUseMin(this)} 分钟）")
             arm()
         } else {
+            val limit = Store.singleUseMin(this)
+            if (limit > 0) Store.setSessionUsed(this, pkg, limit * 60)
             sessionPkg = null
             sessionSeconds = 0
             handler.removeCallbacks(sessionTick)
+            Diag.log("session", "$pkg 挑战没答对，这次的时长算用光（再进来还会弹题）")
         }
         updateOverlay()
     }
@@ -676,6 +751,15 @@ class GuardAccessibilityService : AccessibilityService() {
         /** 单次计时走表时每隔多少秒留一行心跳，家长据此确认「表确实在走」 */
         private const val TICK_LOG_EVERY_S = 30
 
+        /** 已用秒数每隔多少秒落一次盘（进程被杀时最多丢这么久） */
+        private const val PERSIST_EVERY_S = 5
+
+        /**
+         * 「退掉最近任务那一屏」之后多久之内，桌面露面还算成那一下造成的。
+         * 太短会漏（落桌面有小延迟），太长会把他后来自己按的 Home 也吞掉
+         */
+        private const val TASK_RETURN_WINDOW_MS = 2_000L
+
         /**
          * 桌面露头多久之内还算「刚露头」。超过这个时长说明孩子已经在桌面上站着了，
          * 那一次露头的现场就不该再被翻出来用（他站在桌面上按 Home 也不该弹框）
@@ -691,9 +775,21 @@ class GuardAccessibilityService : AccessibilityService() {
             instance?.answerChallenge(ok)
         }
 
-        /** 桌面回到前台：孩子已经离开了刚才那个应用，会话结束 */
+        /** 桌面回到前台：孩子已经离开了刚才那个应用，这一轮的表停在这里（剩余留着） */
         fun onDesktopShown() {
-            instance?.endSession("回到桌面")
+            instance?.pauseSession("回到桌面")
+        }
+
+        /**
+         * 桌面问：「这一下露面是不是我刚退掉最近任务那一屏造成的？是的话他本该在哪个应用里」。
+         * 取值即作废，见 [takeTaskReturn]。
+         */
+        fun consumeTaskReturn(): String? = instance?.takeTaskReturn()
+
+        /** 自检报告里的一行：「退掉任务列表」这件事此刻在不在生效 */
+        fun taskKillStateText(ctx: Context): String {
+            val s = instance ?: return "✗ 没生效：无障碍服务没在运行"
+            return s.taskKillOffReason()?.let { "✗ 没生效：$it" } ?: "✓ 生效中"
         }
 
         /** 桌面判「这一次露面要不要弹挑战框」的证据，见 [beforeLauncher] */
@@ -751,6 +847,17 @@ class GuardAccessibilityService : AccessibilityService() {
                     else -> "当前会话：$pkg 已用 ${s.sessionSeconds} 秒，还剩 ${limit * 60 - s.sessionSeconds} 秒"
                 }
             )
+            // 离开应用只是停表、剩余留着（见 pauseSession）。这一行是「他还剩多少」的答案：
+            // 家长看到孩子一直在用同一批应用时，先来这里核对剩余对不对
+            val usages = Store.sessionUsages(ctx)
+            if (usages.isNotEmpty() && limit > 0) {
+                sb.appendLine("各应用还剩多少（离开只停表，回来接着用）：")
+                usages.toSortedMap().forEach { (k, v) ->
+                    val left = (limit * 60 - v).coerceAtLeast(0)
+                    val sign = if (left <= 0) "已用光（再进去就弹题）" else "还剩 ${left / 60}:${(left % 60).toString().padStart(2, '0')}"
+                    sb.appendLine("  · $k：已用 ${v}s，$sign")
+                }
+            }
             sb.appendLine("正在等答题：${s.challengeFor ?: "无"}")
             // 光看「view 不为 null」会说谎：会话一停这行小字就被藏起来（见 updateOverlay），
             // 但 view 还在、文字还留着上一次的「本次剩余 9:41」，报告里就写成「现在挂着 9:41」

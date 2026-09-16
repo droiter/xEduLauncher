@@ -16,7 +16,8 @@ class LauncherConfig {
   List<String> noChallenge;
   int dailyLimitMin;
 
-  /// 单次使用时长上限（分钟，0 = 不限）：孩子在同一个白名单应用里连续用满这么久就弹乘法题
+  /// 单次使用时长上限（分钟，0 = 不限）：孩子在同一个白名单应用里用满这么久就弹乘法题。
+  /// 离开应用只是停表、剩余保留（原生侧按包名存着），只有答对乘法题才归零重新给满
   int singleUseMin;
   int graceMin;
   int openLimit;
@@ -55,7 +56,7 @@ class LauncherConfig {
     this.allowed = const [],
     this.noChallenge = const [],
     this.dailyLimitMin = 0,
-    this.singleUseMin = 5,
+    this.singleUseMin = 10,
     this.graceMin = 10,
     this.openLimit = 0,
     this.usedSeconds = 0,
@@ -82,7 +83,7 @@ class LauncherConfig {
     allowed: (m['allowed'] as List?)?.cast<String>() ?? const [],
     noChallenge: (m['noChallenge'] as List?)?.cast<String>() ?? const [],
     dailyLimitMin: (m['dailyLimitMin'] as num?)?.toInt() ?? 0,
-    singleUseMin: (m['singleUseMin'] as num?)?.toInt() ?? 5,
+    singleUseMin: (m['singleUseMin'] as num?)?.toInt() ?? 10,
     graceMin: (m['graceMin'] as num?)?.toInt() ?? 10,
     openLimit: (m['openLimit'] as num?)?.toInt() ?? 0,
     usedSeconds: (m['usedSeconds'] as num?)?.toInt() ?? 0,

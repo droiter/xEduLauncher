@@ -45,19 +45,28 @@ object Store {
     private const val K_FILE_SERVER = "file_server_enabled"
     private const val K_APPROVED_IPS = "file_server_approved_ips"
 
+    /** 每个白名单应用「这一次已经用掉多少秒」，键是 session_used_<包名> */
+    private const val K_SESSION_USED_PREFIX = "session_used_"
+
     const val DEFAULT_PASSWORD = "123456"
 
     /** 文件传输服务默认端口；被占用时由 HttpGateway 往后顺延 */
     const val DEFAULT_FILE_PORT = 8080
 
-    /** 单次使用时长缺省值：家长不设也有 5 分钟 */
-    const val DEFAULT_SINGLE_USE_MIN = 5
+    /** 单次使用时长缺省值：家长不设也有 10 分钟 */
+    const val DEFAULT_SINGLE_USE_MIN = 10
 
     /** 距上次进入桌面超过该毫秒数，才把本次进入算作一次新的“打开” */
     private const val NEW_OPEN_GAP_MS = 120_000L
 
     /** 守护弹回桌面后，这段时间内的「回到桌面」不再算孩子按的 Home */
     private const val GUARD_BOUNCE_WINDOW_MS = 2_500L
+
+    /** 默认桌面判定的缓冲窗口：这段时间内读到过 true，读不到的那一两次就按生效处理 */
+    private const val DEFAULT_LAUNCHER_GRACE_MS = 30_000L
+
+    /** 上一次读到「本应用确实是默认桌面」的时刻（进程内即可，见 [isDefaultLauncher]） */
+    private var lastDefaultTrueAt = 0L
 
     private fun p(ctx: Context) = ctx.getSharedPreferences(FILE, Context.MODE_PRIVATE)
 
@@ -69,17 +78,18 @@ object Store {
     private fun bool(ctx: Context, k: String, d: Boolean) = p(ctx).getBoolean(k, d)
     private fun num(ctx: Context, k: String, d: Int) = p(ctx).getInt(k, d)
 
-    /** 跨天则清零当日统计 */
+    /** 跨天则清零当日统计，单次使用时长也一并给满（第二天是新的一天） */
     fun rollDate(ctx: Context) {
         val prefs = p(ctx)
         val d = prefs.getString(K_STAT_DATE, "")
         if (d != today()) {
-            prefs.edit()
+            val e = prefs.edit()
                 .putString(K_STAT_DATE, today())
                 .putInt(K_USED_SECONDS, 0)
                 .putInt(K_EXTRA_SECONDS, 0)
                 .putInt(K_OPEN_COUNT, 0)
-                .apply()
+            prefs.all.keys.filter { it.startsWith(K_SESSION_USED_PREFIX) }.forEach { e.remove(it) }
+            e.apply()
         }
     }
 
@@ -113,10 +123,43 @@ object Store {
     fun dailyLimitMin(ctx: Context) = num(ctx, K_DAILY_LIMIT_MIN, 0)
 
     /**
-     * 单次使用时长上限（分钟），0 = 不限。算的是「连续待在同一个白名单应用里」的时长，
+     * 单次使用时长上限（分钟），0 = 不限。算的是「待在同一个白名单应用里」的时长，
      * 由无障碍守护按窗口切换计时，到点弹一道一位数乘法：答对清零重新计时，答错送回桌面。
+     *
+     * 离开这个应用只是**停表**，已经用掉的秒数留着（见 [sessionUsed]），再进来接着用剩下的；
+     * 只有答对乘法题才把这次时长归零重新给满。孩子按一下 Home 再回来就能把时间刷满的日子
+     * 到此为止——2026-09-16 owner 反馈「切后台再返回剩余时间复原，限时失效」后改的。
      */
     fun singleUseMin(ctx: Context) = num(ctx, K_SINGLE_USE_MIN, DEFAULT_SINGLE_USE_MIN)
+
+    // ---------- 单次使用时长的剩余（每个应用各存一份） ----------
+
+    fun sessionUsed(ctx: Context, pkg: String): Int = p(ctx).getInt(K_SESSION_USED_PREFIX + pkg, 0)
+
+    fun setSessionUsed(ctx: Context, pkg: String, seconds: Int) {
+        p(ctx).edit().putInt(K_SESSION_USED_PREFIX + pkg, seconds.coerceAtLeast(0)).apply()
+    }
+
+    /** 单个应用清零 = 重新给满（答对乘法题时调用） */
+    fun clearSessionUsed(ctx: Context, pkg: String) {
+        p(ctx).edit().remove(K_SESSION_USED_PREFIX + pkg).apply()
+    }
+
+    /** 全部清零：家长改了上限、跨天、开机时用 */
+    fun clearAllSessionUsed(ctx: Context) {
+        val prefs = p(ctx)
+        val keys = prefs.all.keys.filter { it.startsWith(K_SESSION_USED_PREFIX) }
+        if (keys.isEmpty()) return
+        val e = prefs.edit()
+        keys.forEach { e.remove(it) }
+        e.apply()
+    }
+
+    /** 自检报告用：现在哪些应用还欠着时长（用过才记） */
+    fun sessionUsages(ctx: Context): Map<String, Int> =
+        p(ctx).all.entries
+            .filter { it.key.startsWith(K_SESSION_USED_PREFIX) && (it.value as? Int ?: 0) > 0 }
+            .associate { it.key.removePrefix(K_SESSION_USED_PREFIX) to (it.value as Int) }
     fun graceMin(ctx: Context) = num(ctx, K_GRACE_MIN, 10)
     fun openLimit(ctx: Context) = num(ctx, K_OPEN_LIMIT, 0)
     fun usedSeconds(ctx: Context) = num(ctx, K_USED_SECONDS, 0)
@@ -339,15 +382,88 @@ object Store {
 
     // ---------- 系统能力 ----------
 
+    /**
+     * 本应用是不是系统当前的默认桌面。
+     *
+     * **别改回只看一次 resolveActivity。** 2026-09-16 owner 的真机日志里，那一版连续 7 个半小时
+     * 判定「本应用不是系统默认桌面」（而同一份自检报告里明明写着 true），期间前台守护整体停摆：
+     * 任务键那一屏不退了、非白名单应用也不弹回了——「按任务键还能看到任务列表、能切到不受控的
+     * 任务」就是这么来的。ROLE_HOME 是 Android 10+ 上这件事的权威判据，先问它；解析那两条留作
+     * 兜底（有的 ROM 是从旧设置页设的默认桌面）；再加一个「半分钟内见过 true」的缓冲：系统在
+     * 切换桌面/刚开机/包管理器正忙时偶尔读不到，不该让整个管控停摆。
+     */
     fun isDefaultLauncher(ctx: Context): Boolean {
+        if (roleHoldsHome(ctx) || resolveIsHome(ctx, defaultOnly = true) || resolveIsHome(ctx, defaultOnly = false)) {
+            lastDefaultTrueAt = SystemClock.elapsedRealtime()
+            return true
+        }
+        return SystemClock.elapsedRealtime() - lastDefaultTrueAt < DEFAULT_LAUNCHER_GRACE_MS
+    }
+
+    private fun roleHoldsHome(ctx: Context): Boolean = try {
+        if (Build.VERSION.SDK_INT >= 29) {
+            val rm = ctx.getSystemService(Context.ROLE_SERVICE) as? android.app.role.RoleManager
+            rm != null && rm.isRoleAvailable(android.app.role.RoleManager.ROLE_HOME) &&
+                rm.isRoleHeld(android.app.role.RoleManager.ROLE_HOME)
+        } else {
+            false
+        }
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun resolveIsHome(ctx: Context, defaultOnly: Boolean): Boolean = try {
         val home = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+        val flags = if (defaultOnly) PackageManager.MATCH_DEFAULT_ONLY else 0
         val res = if (Build.VERSION.SDK_INT >= 33) {
-            ctx.packageManager.resolveActivity(home, PackageManager.ResolveInfoFlags.of(0L))
+            ctx.packageManager.resolveActivity(home, PackageManager.ResolveInfoFlags.of(flags.toLong()))
         } else {
             @Suppress("DEPRECATION")
-            ctx.packageManager.resolveActivity(home, 0)
+            ctx.packageManager.resolveActivity(home, flags)
         }
-        return res?.activityInfo?.packageName == ctx.packageName
+        res?.activityInfo?.packageName == ctx.packageName
+    } catch (_: Exception) {
+        false
+    }
+
+    /**
+     * 自检报告用：两种查法各自看到了什么。以后再出现「明明是默认桌面却判成不是」，
+     * 这一行直接给出是哪条判据翻的车，不用再猜。
+     */
+    fun defaultLauncherDetail(ctx: Context): String {
+        val role = if (Build.VERSION.SDK_INT >= 29) {
+            try {
+                val rm = ctx.getSystemService(Context.ROLE_SERVICE) as? android.app.role.RoleManager
+                when {
+                    rm == null -> "拿不到 RoleManager"
+                    !rm.isRoleAvailable(android.app.role.RoleManager.ROLE_HOME) -> "系统不提供"
+                    rm.isRoleHeld(android.app.role.RoleManager.ROLE_HOME) -> "已持有 ✓"
+                    else -> "没持有 ✗"
+                }
+            } catch (e: Exception) {
+                "读取出错：${e.javaClass.simpleName}"
+            }
+        } else {
+            "API ${Build.VERSION.SDK_INT} < 29"
+        }
+        val resolveLabel = { defaultOnly: Boolean ->
+            val home = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+            val flags = if (defaultOnly) PackageManager.MATCH_DEFAULT_ONLY else 0
+            val res = try {
+                if (Build.VERSION.SDK_INT >= 33) {
+                    ctx.packageManager.resolveActivity(home, PackageManager.ResolveInfoFlags.of(flags.toLong()))
+                } else {
+                    @Suppress("DEPRECATION")
+                    ctx.packageManager.resolveActivity(home, flags)
+                }
+            } catch (_: Exception) {
+                null
+            }
+            val ai = res?.activityInfo
+            if (ai == null) "（没解析到）" else "${ai.packageName}/${ai.name.substringAfterLast('.')}"
+        }
+        return "ROLE_HOME：$role；resolveActivity（带默认过滤）：${resolveLabel(true)}；" +
+            "（不带过滤）：${resolveLabel(false)}"
     }
 
     fun hasOverlay(ctx: Context): Boolean =
@@ -414,7 +530,13 @@ object Store {
             )
         }
         (m["dailyLimitMin"] as? Number)?.let { e.putInt(K_DAILY_LIMIT_MIN, it.toInt()) }
-        (m["singleUseMin"] as? Number)?.let { e.putInt(K_SINGLE_USE_MIN, it.toInt().coerceIn(0, 120)) }
+        (m["singleUseMin"] as? Number)?.let {
+            val v = it.toInt().coerceIn(0, 120)
+            // 上限变了就重新给满：家长把 10 分钟改成 3 分钟时，孩子不该因为「按旧上限已经用掉
+            // 5 分钟」而一开应用就被弹题——那笔账是旧上限下记的，作废
+            if (v != num(ctx, K_SINGLE_USE_MIN, DEFAULT_SINGLE_USE_MIN)) clearAllSessionUsed(ctx)
+            e.putInt(K_SINGLE_USE_MIN, v)
+        }
         (m["graceMin"] as? Number)?.let { e.putInt(K_GRACE_MIN, it.toInt()) }
         (m["openLimit"] as? Number)?.let { e.putInt(K_OPEN_LIMIT, it.toInt()) }
         (m["guardEnabled"] as? Boolean)?.let { e.putBoolean(K_GUARD_ENABLED, it) }

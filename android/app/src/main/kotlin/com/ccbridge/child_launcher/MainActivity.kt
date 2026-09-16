@@ -128,6 +128,8 @@ class MainActivity : FlutterActivity() {
      *
      * 兜底那几条都要求证据「放了一会儿」：这一下露面本身就会把桌面拉到最前、把 Activity
      * 暂停/重建，那些变化都在毫秒之前，是这一下自己造成的，不算数——[FRESH_MS] 就是这条线。
+     * 同时还要「没放太久」：一段陈年证据（比如放了一夜）同样说明不了他刚从应用里回来，
+     * 见 [EVIDENCE_MAX_MS]。
      */
     private fun judgeAppearance(): Pair<Boolean, String> {
         val now = SystemClock.elapsedRealtime()
@@ -155,10 +157,15 @@ class MainActivity : FlutterActivity() {
             before != null && before.isEmpty() -> false to "刚才盖在上面的是本应用自己的页面"
             before != null && before in allowedList ->
                 true to "无障碍看见桌面之前是 $before（孩子白名单里的应用）"
-            other > self -> true to "最后露头的是别的应用（$front，${ago(now, other)}前）"
-            leftScreen != 0L && now - leftScreen >= FRESH_MS ->
+            // 兜底证据既要「放了一会儿」（FRESH_MS：这一下露面自己造成的现场变化不算数），
+            // 也要「没放太久」（EVIDENCE_MAX_MS）。以前只卡了下限，于是 2026-09-16 的真机日志里
+            // 出现过：孩子熬夜放了一夜、屏幕一亮桌面回到最前，系统拿 **6.8 小时前**「别的应用
+            // 露过头」当证据弹了一道题，顺带把他那一轮计时也结束了。证据老到这个份上什么都说明不了
+            other > self && now - other <= EVIDENCE_MAX_MS ->
+                true to "最后露头的是别的应用（$front，${ago(now, other)}前）"
+            leftScreen != 0L && now - leftScreen in FRESH_MS..EVIDENCE_MAX_MS ->
                 true to "桌面这次回来前离开过屏幕（${ago(now, leftScreen)}前）"
-            leftFg >= FRESH_MS -> true to "Activity 已离开前台 ${leftFg}ms"
+            leftFg in FRESH_MS..EVIDENCE_MAX_MS -> true to "Activity 已离开前台 ${leftFg}ms"
             else -> false to "没拿到「从别处回来」的证据（最前=$front，桌面之前=${before ?: "（看不出）"}，" +
                 "离开前台 ${leftFg}ms）"
         }
@@ -232,11 +239,15 @@ class MainActivity : FlutterActivity() {
     override fun onResume() {
         super.onResume()
         inForeground = true
+        // 这一下露面是不是「刚退掉最近任务那一屏」造成的？三星手势导航下，从多任务视图按返回
+        // 会落到桌面上，孩子并不是想回桌面——那一下返回键是本应用发的。取到了就直接把他送回
+        // 刚才那个应用，不弹挑战框（家长要的是「任务键＝留在当前应用」）。
+        val taskReturn = GuardAccessibilityService.consumeTaskReturn()
         // 桌面这一次露面要不要弹挑战框。判定必须赶在下面清现场之前——那时读到的才是
         // 「这一次露面之前」的状态。每一次露面只判一次：孩子按 Home 让系统把桌面重新拉起来、
         // 可桌面本来就在最前面时（没有 onPause/onResume 那一轮）根本走不到这里，
         // 系统真把它重新拉起来的那种也已经在这一次判过了，不会再翻出上一次用过的应用弹题
-        val escape = if (appearanceJudged) null else judgeAppearance()
+        val escape = if (taskReturn != null || appearanceJudged) null else judgeAppearance()
         appearanceJudged = true
         val viaHome = viaHomeIntent
         viaHomeIntent = false
@@ -268,9 +279,16 @@ class MainActivity : FlutterActivity() {
         // 家长已经从系统设置那边回来了，前台守护立刻恢复管控
         Store.clearParentFree(this)
         // 超时 / 超次数 → 拉起密码锁屏
-        Store.gateReason(this)?.let {
+        val gated = Store.gateReason(this)?.also {
             Diag.log("gate", "命中限制 $it，拉起密码页")
             Store.showLock(this, it)
+        }
+        // 退掉「最近任务」那一屏之后落到桌面的这一下：把他送回刚才那个应用，不弹挑战框。
+        // 顺序放在门禁后面——时长/次数用完时该出现的是密码页，不能把他又塞回应用里
+        if (taskReturn != null && gated == null) {
+            consumeHomeEvidence()
+            Diag.log("home", "退掉「最近任务」那一屏后落到桌面 → 送回 $taskReturn（不弹挑战框）")
+            returnToApp(taskReturn, "刚退掉「最近任务」那一屏")
         }
         // 有设备在等「同意」而同意页当时没能弹出来（后台启动被系统拦了），这里补一次
         HttpGateway.onLauncherResume(this)
@@ -583,27 +601,32 @@ class MainActivity : FlutterActivity() {
      * 桌面得答对才进得去。「刚才在用哪个」由前台守护记着；记不到、或者那个应用已经不在白名单
      * （送回去也会被守护立刻弹回来），就只能让他留在桌面。
      */
-    private fun returnToLastApp(): Boolean {
-        val pkg = Store.lastForeign(this)
+    private fun returnToLastApp(): Boolean = returnToApp(Store.lastForeign(this), "挑战没过")
+
+    /**
+     * 把孩子送回 [pkg] 接着用。[why] 会原样写进日志和审计：是「挑战没过」送回去的，
+     * 还是「刚退掉最近任务那一屏」送回去的——两者在日志里要能分开。
+     */
+    private fun returnToApp(pkg: String?, why: String): Boolean {
         if (pkg == null) {
-            Diag.log("home", "挑战没过，但没有「刚才在用哪个应用」的记录，只能留在桌面")
+            Diag.log("home", "$why，但没有「刚才在用哪个应用」的记录，只能留在桌面")
             return false
         }
         if (Store.frontGuard(this) && pkg !in Store.allowed(this)) {
-            Diag.log("home", "挑战没过，但 $pkg 已不在白名单，送回去也会被守护弹回来，留在桌面")
+            Diag.log("home", "$why，但 $pkg 已不在白名单，送回去也会被守护弹回来，留在桌面")
             return false
         }
         val i = packageManager.getLaunchIntentForPackage(pkg)
         if (i == null) {
-            Diag.log("home", "挑战没过，但 $pkg 没有启动入口（已卸载？），留在桌面")
+            Diag.log("home", "$why，但 $pkg 没有启动入口（已卸载？），留在桌面")
             return false
         }
         // 不带 RESET_TASK_IF_NEEDED：要的是把他放回原来那一屏，不是重启这个应用
         i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         return try {
             startActivity(i)
-            Diag.log("home", "挑战没过，把孩子送回 $pkg")
-            Audit.record(Audit.RETURN, pkg, "挑战没过，把孩子送回去接着用（不带 RESET_TASK）")
+            Diag.log("home", "$why，把孩子送回 $pkg")
+            Audit.record(Audit.RETURN, pkg, "$why，把孩子送回去接着用（不带 RESET_TASK）")
             true
         } catch (e: Exception) {
             Diag.log("home", "送回 $pkg 失败：${e.javaClass.simpleName}: ${e.message}")
@@ -780,6 +803,9 @@ class MainActivity : FlutterActivity() {
         sb.appendLine()
         sb.appendLine("── 默认桌面现状 ──")
         sb.appendLine("本应用是默认桌面：${Store.isDefaultLauncher(this)}")
+        // 这一行是「守护怎么突然不生效了」的答案所在：1.0.16 的日志里这条路翻过车，
+        // 判成「不是默认桌面」之后整个前台守护集体停摆，而上面那一句当时还写着 true
+        sb.appendLine("各判据看到的结果：${Store.defaultLauncherDetail(this)}")
         sb.appendLine("系统当前解析到的桌面：${page(home)}")
         sb.appendLine()
         sb.appendLine("── 系统认不认本应用是桌面候选 ──")
@@ -814,6 +840,7 @@ class MainActivity : FlutterActivity() {
         sb.appendLine()
         sb.appendLine("── 前台守护（拦非白名单应用 + 拒绝任务键）──")
         sb.appendLine("管控此刻在生效吗：${GuardAccessibilityService.guardStateText(this)}")
+        sb.appendLine("「按任务键退掉最近任务」那一屏：${GuardAccessibilityService.taskKillStateText(this)}")
         sb.appendLine("开关已打开：${Store.frontGuard(this)}")
         sb.appendLine("无障碍服务已在系统里启用：${Store.accessibilityOn(this)}")
         sb.appendLine("家长放行中（暂不拦截）：${Store.parentFreeActive(this)}")
@@ -892,6 +919,13 @@ class MainActivity : FlutterActivity() {
          * 把 Activity 暂停/重建，这些变化就发生在毫秒前；只有比这更早就成立的状态才算「他本来就在桌面上」。
          */
         private const val FRESH_MS = 1200L
+
+        /**
+         * 兜底证据的有效期上限。超过这个时长的「他离开过屏幕 / 离开过前台 / 别的应用露过头」
+         * 说明不了「他刚从应用里回来」——中间可能是息屏过夜、重启、家长用了一阵，
+         * 拿它弹题纯属误伤（真机日志里漂到过 6.8 小时）。
+         */
+        private const val EVIDENCE_MAX_MS = 30 * 60_000L
 
         /** 图标统一编码成这么大，够桌面磁贴用，又不至于把通道塞爆 */
         private const val ICON_PX = 128

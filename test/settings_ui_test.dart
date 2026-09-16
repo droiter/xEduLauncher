@@ -80,7 +80,7 @@ void main() {
     expect(find.textContaining('未单独设置，目前沿用家长控制密码'), findsOneWidget);
   });
 
-  testWidgets('单次使用时长上限：缺省 5 分钟，可调', (tester) async {
+  testWidgets('单次使用时长上限：可调，且说明里写明「离开只是暂停、剩余留着」', (tester) async {
     _mock(_config);
     useTallScreen(tester);
     await tester.pumpWidget(const MaterialApp(home: SettingsScreen()));
@@ -89,6 +89,7 @@ void main() {
     expect(find.text('单次使用时长上限'), findsOneWidget);
     expect(find.text('5 分钟'), findsOneWidget);
     expect(find.textContaining('答错了把他送回儿童桌面'), findsOneWidget);
+    expect(find.textContaining('只是暂停计时，剩余时间留着'), findsOneWidget);
   });
 
   testWidgets('单次使用时长上限可以设成「不限」', (tester) async {
