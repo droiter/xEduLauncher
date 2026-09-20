@@ -45,11 +45,26 @@ class GuardAccessibilityService : AccessibilityService() {
     private var lastBounceAt = 0L
 
     /**
-     * 上一次「退掉最近任务那一屏」的时刻。**单独一个计数器**：
+     * 上一次「退掉最近任务那一屏」的时刻，以及退的是哪一屏。**单独一组状态**：
      * 以前两种拦截共用一个节流，孩子刚被弹回桌面又马上按任务键时，那一下会被当「连环弹」丢掉，
-     * 于是任务列表就留在屏幕上了——这正是「按任务键有时候还是能够看到任务列表」的来源。
+     * 于是任务列表就留在屏幕上了。现在只用来挡「同一屏的迟到事件」，不再拿它当按时间放行的闸门
+     * （见 [handleTaskScreen]）。
      */
     private var lastTaskKillAt = 0L
+    private var lastTaskKillPkg: String? = null
+    private var lastTaskKillCls: String? = null
+
+    /**
+     * 「这一次露头的最近任务那一屏，已经退过了」。任何**别的**窗口露头都清掉它——
+     * 清掉之后这一屏再露头，就说明孩子又按了一下任务键，得重新退。
+     */
+    private var taskScreenKilledAt = 0L
+
+    /** 自检报告里那行「任务键到底拦得怎么样」的计数，见 [taskKillReport] */
+    private var taskSeen = 0
+    private var taskKilled = 0
+    private var taskSkippedEcho = 0
+    private var taskSkippedOff = 0
 
     /**
      * 上一次「退掉最近任务那一屏」时孩子正在用的应用，以及那一刻。桌面那边用
@@ -155,12 +170,25 @@ class GuardAccessibilityService : AccessibilityService() {
         // 桌面判断「孩子是不是从应用里退出来的」全靠它
         noteFrontWindow(pkg, cls)
 
+        // 露头的**不是**「最近任务」那一屏，就说明那一屏已经走了（返回键生效了、或者孩子
+        // 自己退出去了）：把「这一屏已经退过」的记号清掉，它下次再露头才算新的一下。
+        // 这一句是「连按任务键时中间那几下不能放过」的关键，见 handleTaskScreen
+        val taskScreen = isTaskSwitchScreen(pkg, cls)
+        if (!taskScreen) taskScreenKilledAt = 0L
+
         if (pkg == packageName) {
             // 自己的桌面、密码页、同意页：不拦，只记「本应用刚在最前面」。
             // 例外：手势导航下有的 ROM 把「最近任务」交给默认桌面（也就是本应用）渲染，
             // 那一屏的窗口同样属于本应用，不按住的话孩子一按任务键就看到任务列表了
-            if (isRecentsClass(cls)) {
-                killTaskScreen(pkg, cls)
+            if (taskScreen) {
+                // 管控没生效时这一屏也退不掉，得跟下面那条路一样说清原因
+                val offTask = taskKillOffReason()
+                if (offTask != null) {
+                    taskSkippedOff++
+                    logThrottled(offTask, "任务键：这一屏本该退掉，但$offTask，只能放过")
+                } else {
+                    handleTaskScreen(pkg, cls)
+                }
                 return
             }
             Store.noteForeground(this, pkg, countAsApp = false)
@@ -186,28 +214,21 @@ class GuardAccessibilityService : AccessibilityService() {
             pauseSession("切到了 $pkg")
         }
 
-        // 「最近任务」优先处理，而且不跟下面那条防连环弹的节流共用计数器（见 lastTaskKillAt）。
+        // 「最近任务」优先处理，而且不跟下面那条防连环弹的节流共用计数器（见 lastBounceAt）。
         // 这一屏多停一帧孩子就多看一帧任务列表，宁可多退一次。
         // 白名单应用自己的窗口除外：「recents / overview」是通用词，孩子的应用里也可能有
         // 这么命名的页面，照退就是把他正看着的界面按掉了（1.0.9 之前没这事——那时这条判断
         // 排在白名单之后，移到这里是为了堵住系统界面那条路，别顺手把孩子的应用也搭进去）
-        if (isTaskSwitchScreen(pkg, cls) && !childApp) {
+        if (taskScreen && !childApp) {
             // 管控没在生效时这一屏退不掉，任务列表就留在屏幕上了——「按任务键有时候还能看到
             // 任务列表」多半问的就是这一行。以前这里是静默 return，日志里查不到任何线索
             val offTask = taskKillOffReason()
             if (offTask != null) {
+                taskSkippedOff++
                 logThrottled(offTask, "任务键：这一屏本该退掉，但$offTask，只能放过")
                 return
             }
-            val now = SystemClock.elapsedRealtime()
-            if (now - lastTaskKillAt >= TASK_KILL_GAP_MS) {
-                killTaskScreen(pkg, cls)
-            } else {
-                Diag.log(
-                    "guard",
-                    "任务键：${now - lastTaskKillAt}ms 前刚退过一次，这一下先跳过（$pkg/${cls.substringAfterLast('.')}）",
-                )
-            }
+            handleTaskScreen(pkg, cls)
             return
         }
 
@@ -318,9 +339,52 @@ class GuardAccessibilityService : AccessibilityService() {
         return null
     }
 
+    /**
+     * 「最近任务」那一屏露头了，该不该退。
+     *
+     * **判定不能只看时间**。1.0.18 之前这里是一道「两次退屏之间必须隔 700ms」的节流：
+     * 孩子（或家长测试时）连按任务键，按得比 700ms 快，中间那几下就整段跳过——而「跳过」
+     * 的意思是**那一屏就这么留在他眼前**，留着的任务列表还能点进去。2026-09-17 的真机日志里
+     * 9 秒内这一屏露头 13 次、退了 7 次、跳过 6 次，跳过的时刻正好就是「还能看到任务列表」。
+     *
+     * 改成认「这一次露头」：退过一次之后，只有等到**别的窗口**露头（说明那一屏确实走了，
+     * 见 onAccessibilityEvent 里那句清记号）才算下一次。同一屏在这中间反复报事件一律当重复事件
+     * ——那是同一个窗口在刷状态，不是孩子又按了一下，再按一次返回键反而会打到孩子正用着的应用上
+     * （把这个应用按退出了，这是老版本那条 700ms 当初要防的事）。
+     */
+    private fun handleTaskScreen(pkg: String, cls: String) {
+        taskSeen++
+        val now = SystemClock.elapsedRealtime()
+        if (taskScreenKilledAt != 0L) {
+            if (now - taskScreenKilledAt <= TASK_KILL_RETRY_MS) {
+                taskSkippedEcho++
+                logThrottled(
+                    "taskScreenEcho",
+                    "任务键：同一屏刚退过（${now - taskScreenKilledAt}ms 前），重复事件放过",
+                )
+                return
+            }
+            // 退了这么久这一屏还在 ⇒ 那一下返回键没生效（系统正忙、或落到了别处），再退一次
+            Diag.log("guard", "任务键：${now - taskScreenKilledAt}ms 前退过但这一屏还在，再退一次")
+        } else if (pkg == lastTaskKillPkg && cls == lastTaskKillCls && now - lastTaskKillAt < TASK_KILL_ECHO_MS) {
+            // 那一屏走后别的窗口已经露过头（记号清了），紧接着又来一条同一屏的迟到事件。
+            // 别对已经不在最前面的窗口再发一次返回键——那一下会打到现在这个界面上
+            taskSkippedEcho++
+            logThrottled("taskScreenEcho", "任务键：${now - lastTaskKillAt}ms 前刚退的同一屏迟到事件，放过")
+            return
+        }
+        killTaskScreen(pkg, cls)
+    }
+
     /** 退掉最近任务那一屏，让孩子留在当前应用里 */
     private fun killTaskScreen(pkg: String, cls: String) {
-        lastTaskKillAt = SystemClock.elapsedRealtime()
+        val now = SystemClock.elapsedRealtime()
+        lastTaskKillAt = now
+        lastTaskKillPkg = pkg
+        lastTaskKillCls = cls
+        // 「这一次露头已经退过了」。别的窗口露头时清掉，见 onAccessibilityEvent
+        taskScreenKilledAt = now
+        taskKilled++
         // 三星手势导航下，从多任务视图按返回会落到桌面上（不是回到原来那个应用）——桌面那一次
         // 露面就是这么来的。记下他本该待在哪个应用里，桌面那边看到这次的记录就把他送回去
         // （见 consumeTaskReturn / MainActivity.onResume），不弹挑战框。
@@ -363,7 +427,12 @@ class GuardAccessibilityService : AccessibilityService() {
             val home = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
             packageManager.queryIntentActivities(home, 0)
                 .map { it.activityInfo.packageName }
-                .filter { it != packageName }
+                // 系统那个兜底桌面：每台机器上它都在 HOME 候选里，但它从来不是孩子看到的多任务视图，
+                // 而它的包名是 com.android.settings——不排掉的话，**整个「设置」应用**的每个页面
+                // 都会被当成任务屏按一下返回键（2026-09-17 日志里的
+                // 「任务键：退掉 com.android.settings/DeepLinkHomepageActivity」就是这么来的，
+                // 家长在设置页里会被莫名其妙按出去）
+                .filter { it != packageName && it != FALLBACK_HOME_PKG }
                 .toSet()
         } catch (_: Exception) {
             emptySet()
@@ -739,11 +808,21 @@ class GuardAccessibilityService : AccessibilityService() {
     }
 
     companion object {
+        /** 系统兜底桌面的包名（FallbackHome），见 [otherHomeApps] */
+        private const val FALLBACK_HOME_PKG = "com.android.settings"
+
         /** 两次「弹回桌面」之间的最小间隔：挨着弹会闪屏 */
         private const val BOUNCE_GAP_MS = 600L
 
-        /** 两次「退掉任务列表」之间的最小间隔：太密会把孩子应用里的返回键也一起按掉 */
-        private const val TASK_KILL_GAP_MS = 700L
+        /**
+         * 刚退过的那一屏要是紧接着又报同一条事件，这段时间内不再退：那是同一个窗口在刷状态，
+         * 而那一下返回键会落到现在已经换成别人的界面上（把孩子正用着的应用按退出了）。
+         * **不是按时间放行的闸门**：孩子真按了任务键，中间一定隔着别的窗口露头，走不到这条
+         */
+        private const val TASK_KILL_ECHO_MS = 300L
+
+        /** 退过之后这一屏还赖着多久，就再退一次（返回键那一下没生效时的兜底） */
+        private const val TASK_KILL_RETRY_MS = 1_500L
 
         /** 同一条「放行/放过」日志的重复抑制窗口，见 logThrottled */
         private const val ALLOW_LOG_GAP_MS = 10_000L
@@ -790,6 +869,20 @@ class GuardAccessibilityService : AccessibilityService() {
         fun taskKillStateText(ctx: Context): String {
             val s = instance ?: return "✗ 没生效：无障碍服务没在运行"
             return s.taskKillOffReason()?.let { "✗ 没生效：$it" } ?: "✓ 生效中"
+        }
+
+        /**
+         * 自检报告里的一行：「按任务键还能看到任务列表」到底卡在哪一步。
+         * 露头几次、退掉几次、因为什么放过几次，一眼就能对上——不用再去翻日志里那几十行 [guard]。
+         */
+        fun taskKillReport(): String {
+            val s = instance ?: return "（无障碍服务没在运行，这些数字拿不到）\n"
+            if (s.taskSeen == 0 && s.taskSkippedOff == 0) {
+                return "（服务运行以来还没见过「最近任务」那一屏）\n"
+            }
+            return "服务运行以来：这一屏露头 ${s.taskSeen} 次、退掉 ${s.taskKilled} 次、" +
+                "因同一屏重复事件放过 ${s.taskSkippedEcho} 次、因管控没生效放过 ${s.taskSkippedOff} 次\n" +
+                "（「露头」应当等于「退掉」；放过的次数多，说明当时管控没生效，或者系统忙到返回键没吃上）\n"
         }
 
         /** 桌面判「这一次露面要不要弹挑战框」的证据，见 [beforeLauncher] */

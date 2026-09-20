@@ -90,6 +90,7 @@ class _SettingsScreenState extends State<SettingsScreen>
       title: '桌面自检',
       body: report,
       onCopy: () async => Clipboard.setData(ClipboardData(text: report)),
+      onClear: _clearDiagLogs,
     );
   }
 
@@ -99,11 +100,42 @@ class _SettingsScreenState extends State<SettingsScreen>
     _toast('自检日志已复制，粘贴给我即可');
   }
 
-  /// 内容可选可滚动、带「复制」按钮的对话框
+  /// 「清空日志」：运行日志、行为审计、历史自检报告一起删，删了恢复不了，先确认一次。
+  /// 清完不回读报告——那会立刻再写一份自检报告文件出来，看着像没清干净。
+  Future<void> _clearDiagLogs() async {
+    final yes = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('清空历史日志？'),
+        content: const Text(
+          '运行日志、行为审计、logs/ 里的历史自检报告都会删掉，删了找不回来。\n\n'
+          '清空后从这一刻起重新记录：再打开「桌面自检」，报告里就只有清空之后发生的事，'
+          '不用在几百条旧记录里找这次现场。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('清空'),
+          ),
+        ],
+      ),
+    );
+    if (yes != true) return;
+    final n = await Native.clearDiagLogs();
+    if (!mounted) return;
+    _toast('历史日志已清空（$n 个文件），从现在起重新记录');
+  }
+
+  /// 内容可选可滚动、带「复制」按钮的对话框。[onClear] 非空时再多一个「清空日志」
   Future<void> _showCopyableDialog({
     required String title,
     required String body,
     required Future<void> Function() onCopy,
+    Future<void> Function()? onClear,
   }) {
     return showDialog<void>(
       context: context,
@@ -127,6 +159,17 @@ class _SettingsScreenState extends State<SettingsScreen>
             icon: const Icon(Icons.copy_all, size: 18),
             label: const Text('复制'),
           ),
+          if (onClear != null)
+            TextButton.icon(
+              onPressed: () async {
+                // 先把这份对话框收掉：清空之后它显示的内容就过时了，
+                // 留着家长会以为「清了但报告没变」
+                Navigator.pop(ctx);
+                await onClear();
+              },
+              icon: const Icon(Icons.delete_outline, size: 18),
+              label: const Text('清空日志'),
+            ),
           TextButton(
             onPressed: () => Navigator.pop(ctx),
             child: const Text('知道了'),
@@ -295,7 +338,9 @@ class _SettingsScreenState extends State<SettingsScreen>
                   title: const Text('桌面自检'),
                   subtitle: const Text(
                     '设不上默认桌面、Home 键弹框不对时点这里，可一键复制发给开发者；\n'
-                    '同一份报告和运行日志也会存成文件，可从下面「文件传输」里下载',
+                    '同一份报告和运行日志也会存成文件，可从下面「文件传输」里下载。\n'
+                    '报告里的「清空日志」会把历史运行日志、行为审计、旧自检报告删掉，'
+                    '从那一刻起重新记录——要复现某个问题时，先清一下再看报告最省事',
                   ),
                   trailing: const Icon(Icons.bug_report_outlined),
                   onTap: _showDiag,

@@ -147,6 +147,11 @@ class Native {
   static Future<String> launcherDiag() async =>
       await _ch.invokeMethod<String>('launcherDiag') ?? '（原生侧没有返回诊断信息）';
 
+  /// 清空历史日志：运行日志、行为审计、logs/ 里的历史自检报告一并删掉，从此刻起重新记录。
+  /// 返回删掉的文件数。
+  static Future<int> clearDiagLogs() async =>
+      await _ch.invokeMethod<int>('launcherDiagClear') ?? 0;
+
 
   static Future<void> openSystemSettings() => _ch.invokeMethod('openSystemSettings');
 

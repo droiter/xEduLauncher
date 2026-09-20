@@ -425,6 +425,9 @@ class MainActivity : FlutterActivity() {
                 Audit.record(Audit.REPORT, "", "生成桌面自检报告（含行为审计）并存成文件")
                 result.success(launcherDiag())
             }
+            // 清空历史日志。清完不回报告：报告一生成又会写一份文件、还多两条记录，
+            // 家长看到「刚清完 logs/ 里就有东西」会以为没清干净——他要的是从此刻起重新记
+            "launcherDiagClear" -> result.success(Diag.clearAll(this))
             "openSystemSettings" -> {
                 leaveLauncherFor(
                     Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
@@ -846,6 +849,7 @@ class MainActivity : FlutterActivity() {
         sb.appendLine("家长放行中（暂不拦截）：${Store.parentFreeActive(this)}")
         sb.appendLine("放行时长设置：${Store.settingsFreeMin(this)} 分钟")
         sb.appendLine("非白名单应用一露头就被送回桌面；「最近任务」那一屏直接退掉，孩子留在当前应用")
+        sb.append(GuardAccessibilityService.taskKillReport())
         sb.appendLine("放行的系统「选文件」界面（孩子从应用里点「选视频」必经这一屏，不当换应用处理）：")
         sb.append(GuardAccessibilityService.pickerReport())
         sb.appendLine("最近几次拦截见下面日志里的 [guard] 行")

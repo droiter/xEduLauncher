@@ -26,6 +26,9 @@ object Diag {
 
     private const val FILE_NAME = "child_launcher.log"
 
+    /** 自检报告文件名前缀。清空历史日志时按这个前缀认「该删的报告」 */
+    private const val REPORT_PREFIX = "自检报告-"
+
     private val buf = ArrayDeque<String>()
     private val fmt = SimpleDateFormat("MM-dd HH:mm:ss", Locale.US)
     private val fileFmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
@@ -62,6 +65,41 @@ object Diag {
     @Synchronized
     fun dump(): String =
         if (buf.isEmpty()) "（暂无日志）" else buf.joinToString("\n")
+
+    // ---------- 清空 ----------
+
+    /**
+     * 清空历史日志：内存缓冲、落盘文件、轮转文件、以及 logs/ 里的历史自检报告一并删掉，
+     * 之后各记一条「已清空」标记，从此刻起重新记录。家长要在真机上复现问题时，
+     * 先把旧噪音清掉，报告里就只剩这次现场。
+     *
+     * 返回删掉的文件数（不含那两条标记）。
+     */
+    fun clearAll(ctx: Context): Int {
+        synchronized(this) {
+            buf.clear()
+            sinceRotateCheck = 0
+            // 上一轮落盘失败（目录不可写之类）留下的封条也揭掉：能删文件就说明目录可用，
+            // 不揭的话清完照样一条都写不进去，家长看到的是「清了但报告还是空的」
+            diskBroken = false
+        }
+        val dir = logDir(ctx)
+        var removed = deleteFiles(dir, FILE_NAME, "$FILE_NAME.1")
+        removed += Audit.clear(ctx)
+        removed += deleteFiles(dir, *reportNames(dir))
+        // 清完先留一条标记：否则报告一开头就是空的，家长分不清是「刚清过」还是「日志坏了」
+        log("清日志", "历史日志已清空（删掉 $removed 个文件），从此刻起重新记录")
+        Audit.record(Audit.CLEAR, "", "家长清空了历史日志（运行日志+行为审计+历史自检报告，共 $removed 个文件），从此刻起重新记录")
+        return removed
+    }
+
+    /** 历史自检报告的文件名；没有就返回空数组 */
+    private fun reportNames(dir: File): Array<String> =
+        dir.listFiles { f -> f.isFile && f.name.startsWith(REPORT_PREFIX) && f.name.endsWith(".txt") }
+            ?.map { it.name }?.toTypedArray() ?: emptyArray()
+
+    private fun deleteFiles(dir: File, vararg names: String): Int =
+        names.count { File(dir, it).let { f -> f.isFile && f.delete() } }
 
     // ---------- 落盘 ----------
 
@@ -102,7 +140,7 @@ object Diag {
     fun writeReport(ctx: Context, text: String): File? = try {
         val dir = logDir(ctx)
         if (!dir.exists()) dir.mkdirs()
-        val name = "自检报告-${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())}.txt"
+        val name = "${REPORT_PREFIX}${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())}.txt"
         val f = File(dir, name)
         f.writeText(text)
         f

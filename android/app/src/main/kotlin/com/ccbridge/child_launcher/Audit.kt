@@ -72,6 +72,9 @@ object Audit {
     /** 生成自检报告 */
     const val REPORT = "自检"
 
+    /** 清空历史日志（由 [Diag.clearAll] 记下，让家长事后在审计里也能看到这一刻分过界） */
+    const val CLEAR = "清日志"
+
     /** 开机 */
     const val BOOT = "开机"
 
@@ -119,6 +122,20 @@ object Audit {
 
     /** 审计文件；和运行日志同在 files/logs/ 下 */
     fun file(ctx: Context): File = File(Diag.logDir(ctx), FILE_NAME)
+
+    /**
+     * 清空历史日志时由 [Diag.clearAll] 调：缓冲清掉、审计文件和轮转文件删掉。
+     * 返回删掉的文件数。
+     */
+    @Synchronized
+    fun clear(ctx: Context): Int {
+        buf.clear()
+        sinceRotateCheck = 0
+        diskBroken = false
+        return listOf(FILE_NAME, "$FILE_NAME.1").count { name ->
+            File(Diag.logDir(ctx), name).let { f -> f.isFile && f.delete() }
+        }
+    }
 
     private fun append(line: String) {
         if (diskBroken) return

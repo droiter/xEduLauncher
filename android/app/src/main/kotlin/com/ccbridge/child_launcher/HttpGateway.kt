@@ -3,8 +3,11 @@ package com.ccbridge.child_launcher
 import android.content.Context
 import android.content.Intent
 import android.os.SystemClock
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -19,6 +22,7 @@ import java.net.URLEncoder
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.text.SimpleDateFormat
+import java.util.Collections
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
@@ -28,14 +32,27 @@ import java.util.concurrent.atomic.AtomicBoolean
  * 文件传输服务：家长用电脑/手机的浏览器连上这台设备，下载日志、上传视频等文件。
  *
  * 零依赖手写 HTTP/1.1（项目一贯不用第三方库）：
- *   GET  /            文件列表（?d=子目录）
- *   GET  /f?p=路径     下载（支持 Range 分片，可断点续传）
- *   GET  /pub?n=名字   下载「公共下载目录」里本应用上传上去的文件
- *   POST /up          上传，multipart/form-data
+ *   GET  /            目录列表（?p=当前目录）
+ *   GET  /get?p=路径   下载（支持 Range 分片，可断点续传）
+ *   GET  /ls?p=目录    这个目录里已有的名字（JSON），浏览器选完文件先拿它预检重名
+ *   POST /up?p=目录    上传，multipart/form-data
+ *   POST /mkdir?p=目录 在这个目录下新建子目录，字段 name=
  *
- * 根目录是应用私有外部目录 /sdcard/Android/data/<包名>/files，里面 logs/ 是运行日志和自检报告。
- * 上传的文件不落这里，落到设备的公共下载目录 /sdcard/Download/（见 [PublicDownloads]）：
- * 家长传的视频是给孩子那些应用用的，私有目录别的应用根本看不到。
+ * 路径空间（?p= 的值，浏览和上传落点是同一个：浏览到哪一层就传到哪一层）：
+ *   ""              根：列出下面两个位置
+ *   dl              /sdcard/Download/（默认落点，其他应用也看得到）
+ *   dl/子目录/…     Download 下本应用建过的子目录
+ *   files           /sdcard/Android/data/<包名>/files（logs/ 是运行日志和自检报告）
+ *   files/子目录/…  私有目录下随便进出、随便新建
+ *
+ * 两个位置都能进目录、回上一级、新建子目录（owner 2026-09-19 要求：原来只有上传目标一个下拉框，
+ * 想进哪一层得先在列表里点、想回上一级得靠「返回上一层」，建不了目录）。
+ * 注意 Download/ 那半边的目录是 MediaStore 里的记录，只看得见本应用自己放进去的东西（见
+ * [PublicDownloads]）；私有目录那半边是普通文件系统，没这个限制。
+ *
+ * 重名一律**拒绝上传**，不覆盖也不自动改名（owner 2026-09-17 要求）：选的目录里已经有同名文件时
+ * 一个字节都不写，传完在结果页单独列出「因重名未上传」的清单。浏览器那头选完文件会先预检一遍、
+ * 把重名的剔出上传队列，服务端落盘前再查一次兜底（预检到落盘之间文件可能被别处加进来）。
  *
  * 安全上有三道：
  *   ① 服务默认关着，家长要在「家长设置 → 文件传输」里手动打开；
@@ -60,6 +77,28 @@ object HttpGateway {
     /** 家长点了「拒绝」之后，这段时间内同一台设备不再弹框 */
     private const val DENY_COOLDOWN_MS = 60_000L
 
+    /** 路径空间里两个位置的前缀：公共下载目录 / 应用私有目录 */
+    private const val LOC_DL = "dl"
+    private const val LOC_FILES = "files"
+
+    /** 「快捷切换」下拉框里最多列这么多目录，免得目录一多页面就爆 */
+    private const val MAX_TARGET_DIRS = 300
+    private const val MAX_TARGET_DEPTH = 6
+
+    /** 落盘结果 */
+    private const val UP_OK = 0
+    private const val UP_DUP = 1
+    private const val UP_FAIL = 2
+
+    /** PublicDownloads 这次走不通（Android 9 或 MediaStore 插入失败），要退回私有目录写 */
+    private const val UP_FALLBACK = 3
+
+    /** 丢弃字节用的水槽：重名的文件不写盘，但正文照样得从连接里读干净 */
+    private val nullSink = object : OutputStream() {
+        override fun write(b: Int) {}
+        override fun write(b: ByteArray, off: Int, len: Int) {}
+    }
+
     private val lock = Any()
     private val pool = Executors.newFixedThreadPool(4) { r ->
         Thread(r, "http-gateway-conn").apply { isDaemon = true }
@@ -75,6 +114,13 @@ object HttpGateway {
     private var acceptThread: Thread? = null
 
     private val running = AtomicBoolean(false)
+
+    /**
+     * 正在写、还没写完的名字占位（私有目录用绝对路径，公共目录用 "pub:名字"）。
+     * 查重名时除了看磁盘上有没有，还要看这里——两个浏览器同时传同名文件时，
+     * 光看磁盘两边都是「还不存在」，会一起写进去把对方覆盖掉。
+     */
+    private val inflight: MutableSet<String> = Collections.synchronizedSet(HashSet<String>())
 
 
     /** 正在等家长点「同意」的那台设备，null = 没有 */
@@ -275,82 +321,187 @@ object HttpGateway {
         val query = parseQuery(if (q < 0) "" else req.target.substring(q + 1))
 
         when {
-            path == "/" || path == "/index.html" -> listPage(ctx, out, query["d"].orEmpty())
-            path == "/f" -> download(ctx, req, out, query["p"].orEmpty(), ip)
-            path == "/pub" -> downloadPublic(ctx, req, out, query["n"].orEmpty(), ip)
+            // 没带 ?p= 的（家长刚敲地址进来）直接落到默认位置，省得先点一层；
+            // 带了 ?p=（哪怕是空的，面包屑里的「根目录」）就照给的路径渲染
+            path == "/" || path == "/index.html" ->
+                if (query.containsKey("p")) {
+                    listPage(ctx, out, query["p"].orEmpty(), query["done"].orEmpty(), query["err"].orEmpty())
+                } else {
+                    redirect(out, "/?p=${urlEnc(if (PublicDownloads.available()) LOC_DL else LOC_FILES)}")
+                }
+            path == "/get" -> download(ctx, req, out, query["p"].orEmpty(), ip)
+            path == "/ls" -> listNames(ctx, out, query["p"].orEmpty())
             path == "/up" && req.method == "POST" -> upload(ctx, req, br, out, ip)
+            path == "/mkdir" && req.method == "POST" -> mkdir(ctx, req, br, out, ip)
             else -> page(out, 404, "没这个地址")
         }
     }
 
     // ---------- 列表 / 下载 ----------
 
-    private fun listPage(ctx: Context, out: OutputStream, sub: String) {
+    /**
+     * 路径空间里的一条路径收敛成标准形式：
+     * "" 根、dl / dl/子目录、files / files/子目录。不认识的（含 ../ 之类）一律落到根。
+     */
+    private fun normalizePath(p: String): String {
+        val v = p.replace('\\', '/').trim().trim('/')
+        return when {
+            v.isEmpty() -> ""
+            v == LOC_DL || v.startsWith("$LOC_DL/") -> v
+            v == LOC_FILES || v.startsWith("$LOC_FILES/") -> v
+            else -> ""
+        }
+    }
+
+    /** 目录列表里的一行 */
+    private class Entry(val name: String, val path: String, val dir: Boolean, val size: Long, val mtime: Long)
+
+    private fun dlRel(p: String): String = if (p == LOC_DL) "" else p.removePrefix("$LOC_DL/")
+
+    private fun filesRel(p: String): String = if (p == LOC_FILES) "" else p.removePrefix("$LOC_FILES/")
+
+    private fun childPath(p: String, name: String): String = if (p.isEmpty()) name else "$p/$name"
+
+    private fun parentPath(p: String): String? = when {
+        p.isEmpty() -> null
+        p == LOC_DL || p == LOC_FILES -> ""
+        else -> p.substringBeforeLast('/', "")
+    }
+
+    /**
+     * 列一个目录。返回 null 表示这个目录不存在。
+     * 根那一层是虚拟的：只列出两个位置，没有别的。
+     */
+    private fun listingAt(ctx: Context, p: String): List<Entry>? {
+        if (p.isEmpty()) {
+            val out = ArrayList<Entry>()
+            if (PublicDownloads.available()) {
+                out.add(Entry("Download/", LOC_DL, true, 0, 0))
+            }
+            out.add(Entry("files/", LOC_FILES, true, 0, 0))
+            return out
+        }
+        if (p == LOC_DL || p.startsWith("$LOC_DL/")) {
+            val rel = dlRel(p)
+            return PublicDownloads.listAt(ctx, rel).map {
+                Entry(
+                    it.name + if (it.dir) "/" else "",
+                    childPath(p, it.name), it.dir, it.size, it.addedAt,
+                )
+            }
+        }
         val root = Store.filesRoot(ctx)
-        val dir = resolve(root, sub)
-        if (dir == null || !dir.isDirectory) {
-            page(out, 404, "目录不存在")
-            return
-        }
-        val rel = relOf(root, dir)
-        val sb = StringBuilder()
-        sb.append(docHead("儿童桌面 · 文件传输"))
-        sb.append("<h2>儿童桌面文件传输</h2>")
-        sb.append("<p class=mut>根目录：${esc(root.absolutePath)}</p>")
-
-        sb.append("<div class=bar><b>${esc(if (rel.isEmpty()) "/" else "/$rel")}</b>")
-        if (rel.isNotEmpty()) {
-            val up = rel.substringBeforeLast('/', "")
-            sb.append(" <a class=btn href=\"/?d=${urlEnc(up)}\">返回上一层</a>")
-        }
-        sb.append("</div>")
-
-        sb.append("<h3>上传</h3>")
-        sb.append("<form id=upform method=post action=\"/up?back=${urlEnc(rel)}\" enctype=\"multipart/form-data\" class=up>")
-        sb.append("<input id=upfile type=file name=f multiple> ")
-        sb.append("<button id=upbtn type=submit>上传</button>")
-        sb.append("<div id=upprog class=prog hidden><div class=track><i id=upfill></i></div>")
-        sb.append("<div class=\"mut\" id=uptext></div></div>")
-        sb.append(uploadScript())
-        sb.append("</form>")
-        sb.append(
-            "<p class=mut>上传的文件一律保存到设备的公共下载目录 <b>Download/</b>：" +
-                "放那里其他应用也看得到（播放器、孩子的教育应用都能直接选到）；" +
-                "应用私有目录别的应用看不到，所以不用它。</p>"
-        )
-
-        sb.append("<h3>文件</h3><table>")
+        val dir = resolve(root, filesRel(p)) ?: return null
+        if (!dir.isDirectory) return null
         val items = dir.listFiles()
             ?.filter { !it.name.startsWith(".") } // 上传中的临时文件不给看
             ?.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
             ?: emptyList()
-        if (items.isEmpty()) {
-            sb.append("<tr><td class=mut>（这一层还没有文件）</td></tr>")
+        return items.map {
+            Entry(
+                it.name + if (it.isDirectory) "/" else "",
+                childPath(p, it.name), it.isDirectory,
+                if (it.isDirectory) 0L else it.length(), it.lastModified(),
+            )
         }
-        for (f in items) {
-            val childRel = if (rel.isEmpty()) f.name else "$rel/${f.name}"
-            sb.append("<tr><td>")
-            if (f.isDirectory) {
-                sb.append("<a href=\"/?d=${urlEnc(childRel)}\">📁 ${esc(f.name)}/</a>")
-            } else {
-                sb.append("<a href=\"/f?p=${urlEnc(childRel)}\">${esc(f.name)}</a>")
-            }
-            sb.append("</td><td class=mut>${if (f.isDirectory) "目录" else size(f.length())}</td>")
-            sb.append("<td class=mut>${stamp(f.lastModified())}</td></tr>")
-        }
-        sb.append("</table>")
+    }
 
-        // 上传的东西不在这里，在设备的公共下载目录，单独列一节让家长能核对
-        sb.append("<h3>公共下载目录 Download/（上传的文件在这里）</h3><table>")
-        val pub = PublicDownloads.list(ctx)
-        if (!PublicDownloads.available()) {
-            sb.append("<tr><td class=mut>这台设备（Android 9 及以下）没有公共下载目录可写，上传落在下面的 uploads/</td></tr>")
-        } else if (pub.isEmpty()) {
-            sb.append("<tr><td class=mut>（还没有上传过文件）</td></tr>")
+    /** 位置那一排：两个（或这台设备上可用的那几个）顶层位置 */
+    private fun locationLinks(p: String): String {
+        val sb = StringBuilder("<b>位置</b> ")
+        fun link(path: String, label: String) {
+            val here = p == path || (path.isNotEmpty() && p.startsWith("$path/"))
+            if (here) sb.append("<b>$label</b> ")
+            else sb.append("<a class=btn href=\"/?p=${urlEnc(path)}\">$label</a> ")
         }
-        for (r in pub) {
-            sb.append("<tr><td><a href=\"/pub?n=${urlEnc(r.name)}\">${esc(r.name)}</a></td>")
-            sb.append("<td class=mut>${size(r.size)}</td><td class=mut>${stamp(r.addedAt)}</td></tr>")
+        if (PublicDownloads.available()) link(LOC_DL, "Download/（公共下载目录）")
+        link(LOC_FILES, "files/（应用私有目录）")
+        return sb.toString()
+    }
+
+    /** 当前位置的面包屑，每一层都能点 */
+    private fun crumbsOf(p: String): String {
+        val sb = StringBuilder("<a href=\"/?p=\">根目录</a>")
+        if (p.isEmpty()) return sb.toString()
+        val parts = p.split('/')
+        var acc = ""
+        for ((i, seg) in parts.withIndex()) {
+            acc = if (acc.isEmpty()) seg else "$acc/$seg"
+            // 头一段是位置前缀，写成人话，别直接把 dl/files 甩给家长看
+            val label = if (i == 0) (if (seg == LOC_DL) "Download/" else "files/") else seg
+            sb.append(" / ")
+            if (i == parts.size - 1) sb.append("<b>${esc(label)}</b>")
+            else sb.append("<a href=\"/?p=${urlEnc(acc)}\">${esc(label)}</a>")
+        }
+        return sb.toString()
+    }
+
+    private fun listPage(ctx: Context, out: OutputStream, pArg: String, done: String, err: String) {
+        val p = normalizePath(pArg)
+        val entries = listingAt(ctx, p)
+        if (entries == null) {
+            page(out, 404, "目录不存在")
+            return
+        }
+        val target = if (p.isEmpty()) null else resolveTarget(ctx, p)
+        val sb = StringBuilder()
+        sb.append(docHead("儿童桌面 · 文件传输"))
+        sb.append("<h2>儿童桌面文件传输</h2>")
+        sb.append("<p class=mut>应用私有目录：${esc(Store.filesRoot(ctx).absolutePath)}</p>")
+
+        sb.append("<div class=bar>${locationLinks(p)}")
+        sb.append("<div style=\"margin-top:10px\">当前位置：${crumbsOf(p)}")
+        val up = parentPath(p)
+        if (up != null) sb.append(" <a class=btn href=\"/?p=${urlEnc(up)}\">▲ 上一级</a>")
+        sb.append("</div>")
+        if (p.isNotEmpty()) {
+            sb.append("<form method=post action=\"/mkdir?p=${urlEnc(p)}\" class=urow style=\"margin-top:10px\">")
+            sb.append("<input type=text name=name placeholder=\"新子目录的名字\" maxlength=60 required>")
+            sb.append(" <button type=submit>新建子目录</button></form>")
+        }
+        sb.append("</div>")
+
+        if (err.isNotEmpty()) sb.append("<div class=\"bar bad\">${esc(err)}</div>")
+        if (done.isNotEmpty()) sb.append("<div class=\"bar ok\">${esc(done)}</div>")
+
+        if (target != null) {
+            sb.append("<h3>上传文件</h3>")
+            sb.append(
+                "<form id=upform method=post action=\"/up?p=${urlEnc(p)}\" " +
+                    "enctype=\"multipart/form-data\" class=up>"
+            )
+            sb.append("<div class=urow><label>上传到</label><b>${esc(target.label)}</b></div>")
+            sb.append(dirSelect(ctx, p))
+            sb.append("<div class=urow><input id=upfile type=file name=f multiple> ")
+            sb.append("<button id=upbtn type=submit>上传</button></div>")
+            sb.append("<div id=upq class=q hidden></div>")
+            sb.append("<div id=upprog class=prog hidden><div class=track><i id=upfill></i></div>")
+            sb.append("<div class=\"mut\" id=uptext></div></div>")
+            sb.append(uploadScript(p, target.label))
+            sb.append("</form>")
+            sb.append(
+                "<p class=mut>传进来的东西落在<b>当前这一层</b>（浏览到哪一层就传到哪一层）。" +
+                    "目标目录里已经有同名文件的会<b>拒绝上传</b>——不覆盖、也不自动改名，" +
+                    "选完文件会先标出来哪些要跳过，传完还会再列一遍。</p>"
+            )
+            if (target.public) {
+                sb.append("<p class=mut>Download/ 里其他应用也看得到（播放器、孩子的教育应用都能直接选到）。</p>")
+            }
+        } else {
+            sb.append("<div class=\"bar mut\">先在上面选一个位置（Download/ 或 files/），再往里传文件。</div>")
+        }
+
+        sb.append("<h3>这一层</h3><table>")
+        if (entries.isEmpty()) {
+            val why = if (p == LOC_DL) "（这一层还没有本应用放过东西）" else "（这一层是空的）"
+            sb.append("<tr><td class=mut>$why</td></tr>")
+        }
+        for (e in entries) {
+            sb.append("<tr><td>")
+            if (e.dir) sb.append("<a href=\"/?p=${urlEnc(e.path)}\">📁 ${esc(e.name)}</a>")
+            else sb.append("<a href=\"/get?p=${urlEnc(e.path)}\">${esc(e.name)}</a>")
+            sb.append("</td><td class=mut>${if (e.dir) "目录" else size(e.size)}</td>")
+            sb.append("<td class=mut>${if (e.dir) "" else stamp(e.mtime)}</td></tr>")
         }
         sb.append("</table>")
 
@@ -358,7 +509,76 @@ object HttpGateway {
         page(out, html(sb.toString()))
     }
 
-    private fun download(ctx: Context, req: Req, out: OutputStream, rel: String, ip: String) {
+    /** 「快捷切换」下拉框：整个路径空间里能进的目录，选一下就跳过去 */
+    private fun dirSelect(ctx: Context, p: String): String {
+        val sb = StringBuilder("<div class=urow><label for=updir>快捷切换</label>")
+        sb.append("<select id=updir name=dir><option value=\"\">（下拉跳到别的目录）</option>")
+        for ((path, label) in dirOptions(ctx)) {
+            if (path == p) continue
+            sb.append("<option value=\"${esc(path)}\">${esc(label)}</option>")
+        }
+        sb.append("</select></div>")
+        return sb.toString()
+    }
+
+    private fun dirOptions(ctx: Context): List<Pair<String, String>> {
+        val out = ArrayList<Pair<String, String>>()
+        val locs = ArrayList<Pair<String, String>>()
+        if (PublicDownloads.available()) locs.add(LOC_DL to "Download/")
+        locs.add(LOC_FILES to "files/")
+        for ((loc, label) in locs) {
+            out.add(loc to "$label（本层）")
+            val subs = ArrayList<String>()
+            val dl = loc == LOC_DL
+            fillDirs(ctx, dl, if (dl) "" else loc, "", 1, subs)
+            for (s in subs) out.add("$loc/$s" to "$label$s/")
+        }
+        return out.take(MAX_TARGET_DIRS)
+    }
+
+    /** 某个位置下所有子目录（相对路径），最多挖 [MAX_TARGET_DEPTH] 层、总数封顶 */
+    private fun fillDirs(
+        ctx: Context,
+        dl: Boolean,
+        loc: String,
+        rel: String,
+        depth: Int,
+        out: MutableList<String>,
+    ) {
+        if (depth > MAX_TARGET_DEPTH || out.size >= MAX_TARGET_DIRS) return
+        if (dl) {
+            for (e in PublicDownloads.listAt(ctx, rel)) {
+                if (!e.dir) continue
+                val r = if (rel.isEmpty()) e.name else "$rel/${e.name}"
+                out.add(r)
+                fillDirs(ctx, true, loc, r, depth + 1, out)
+            }
+            return
+        }
+        val dir = resolve(Store.filesRoot(ctx), rel) ?: return
+        for (k in dir.listFiles()?.sortedBy { it.name.lowercase() } ?: return) {
+            if (!k.isDirectory || k.name.startsWith(".")) continue
+            val r = if (rel.isEmpty()) k.name else "$rel/${k.name}"
+            out.add(r)
+            fillDirs(ctx, false, loc, r, depth + 1, out)
+        }
+    }
+
+    private fun download(ctx: Context, req: Req, out: OutputStream, p: String, ip: String) {
+        val path = normalizePath(p)
+        if (path == LOC_DL || path.startsWith("$LOC_DL/")) {
+            val rel = dlRel(path)
+            downloadPublic(ctx, req, out, rel.substringBeforeLast('/', ""), rel.substringAfterLast('/'), ip)
+            return
+        }
+        if (path.startsWith("$LOC_FILES/")) {
+            downloadPrivate(ctx, req, out, filesRel(path), ip)
+            return
+        }
+        page(out, 404, "文件不存在")
+    }
+
+    private fun downloadPrivate(ctx: Context, req: Req, out: OutputStream, rel: String, ip: String) {
         val root = Store.filesRoot(ctx)
         val f = resolve(root, rel)
         if (f == null || !f.isFile) {
@@ -434,9 +654,9 @@ object HttpGateway {
     // ---------- 上传 ----------
 
     private fun upload(ctx: Context, req: Req, ins: BackReader, out: OutputStream, ip: String) {
-        // 上传不认「家长当前浏览到哪一层」，一律落到设备的公共下载目录（见 [PublicDownloads]）。
-        // back 只决定传完之后把家长送回哪一页。
-        val back = parseQuery(req.target.substringAfter('?', ""))["back"].orEmpty()
+        val q = parseQuery(req.target.substringAfter('?', ""))
+        var targetVal = normalizePath(q["p"].orEmpty())
+        val back = targetVal
         val ct = req.headers["content-type"].orEmpty()
         val bi = ct.indexOf("boundary=")
         if (bi < 0) {
@@ -453,10 +673,15 @@ object HttpGateway {
             page(out, 400, "上传格式不对")
             return
         }
+        var target = resolveTarget(ctx, targetVal) ?: run {
+            page(out, 400, "上传目标目录不存在")
+            return
+        }
 
-        val publicSaved = ArrayList<String>()
-        val privateSaved = ArrayList<String>()
-        var seq = 0
+        /** 落了盘的：名字 → 落点说明 */
+        val saved = ArrayList<Pair<String, String>>()
+        /** 因重名没传的：名字 → 原因（浏览器预检剔掉的 + 服务端拒掉的，都在这里） */
+        val skipped = ArrayList<Pair<String, String>>()
         while (true) {
             val headers = HashMap<String, String>()
             while (true) {
@@ -465,93 +690,313 @@ object HttpGateway {
                 val i = h.indexOf(':')
                 if (i > 0) headers[h.substring(0, i).trim().lowercase()] = h.substring(i + 1).trim()
             }
-            val name = filenameOf(headers["content-disposition"].orEmpty())?.let { safeName(it) }
-            val pub = if (name != null) PublicDownloads.begin(ctx, name, mimeOf(name)) else null
-            if (pub != null) {
-                val stream = PublicDownloads.out(ctx, pub)
-                val ok = try {
-                    // 必须套一层缓冲：copyUntil 找分隔符是按字节滑窗的，写出去也是按字节——
-                    // 直接怼输出流的话，传一个几十上百 MB 的视频就是几千万次 write 系统调用
-                    if (stream == null) false
-                    else stream.use { BufferedOutputStream(it, 64 * 1024).use { o -> copyUntil(ins, o, delim) } }
-                } catch (e: Exception) {
-                    Diag.log("http", "上传写盘失败：${e.javaClass.simpleName}: ${e.message}")
-                    false
-                }
-                if (ok) {
-                    PublicDownloads.finish(ctx, pub)
-                    publicSaved.add(pub.name)
-                    Diag.log("http", "收到文件 ${pub.name} → 公共下载目录 Download/")
-                    Audit.record(Audit.FILE, pub.name, "$ip 上传的文件落进设备的公共下载目录 Download/")
-                } else {
-                    PublicDownloads.abort(ctx, pub)
+            val disp = headers["content-disposition"].orEmpty()
+            val rawName = filenameOf(disp)
+            if (rawName == null) {
+                // 普通表单字段，没有正文文件。dir= 是没开 JS 时下拉框跟着表单提交上来的目标目录；
+                // skipped= 是浏览器预检剔掉的重名清单（它比服务端先知道，别让家长白等一遍重传）
+                val field = fieldNameOf(disp)
+                val v = readField(ins, delim)
+                if (field == "dir" && v.isNotEmpty()) {
+                    val t2 = resolveTarget(ctx, normalizePath(v))
+                    // 文件段后面才到的 dir 只能作废：前面的已经按老目标写下去了
+                    if (t2 != null && saved.isEmpty() && skipped.isEmpty()) {
+                        targetVal = normalizePath(v)
+                        target = t2
+                    }
+                } else if (field == "skipped") {
+                    parseSkipped(v, skipped)
                 }
             } else {
-                // 兜底：Android 9 及以下没有 Downloads 集合、MediaStore 插入失败，或这一段没带文件名。
-                // 不管走哪条，正文都必须读干净，否则后面几段的头会被当成文件内容
-                val dir = File(Store.filesRoot(ctx), "uploads")
-                if (!dir.isDirectory && !dir.mkdirs()) {
-                    page(out, 500, "目标目录建不出来")
-                    return
-                }
-                val tmp = File(dir, ".upload-${SystemClock.elapsedRealtime()}-${seq++}.part")
-                val ok = try {
-                    FileOutputStream(tmp).use { fos ->
-                        BufferedOutputStream(fos, 64 * 1024).use { copyUntil(ins, it, delim) }
-                    }
-                } catch (e: Exception) {
-                    Diag.log("http", "上传写盘失败：${e.javaClass.simpleName}: ${e.message}")
-                    false
-                }
-                if (name != null && ok && tmp.length() > 0) {
-                    val target = uniqueName(dir, name)
-                    if (tmp.renameTo(target)) {
-                        privateSaved.add(target.name)
-                        Diag.log("http", "收到文件 ${target.name}（${size(target.length())}）→ 私有 uploads/")
-                        Audit.record(
-                            Audit.FILE, target.name,
-                            "$ip 上传的文件落进应用私有目录 uploads/（${size(target.length())}，别的应用看不到）",
-                        )
-                    } else {
-                        tmp.delete()
+                val name = safeName(rawName)
+                var r: Int
+                var place: String
+                if (target.public) {
+                    place = target.label
+                    r = saveToPublic(ctx, ins, delim, target.rel, name)
+                    if (r == UP_FALLBACK) {
+                        // Android 9 及以下没有 Downloads 集合，或 MediaStore 插入失败：退回私有 uploads/
+                        place = "应用私有目录 uploads/（别的应用看不到）"
+                        r = saveToPrivate(ins, delim, File(Store.filesRoot(ctx), "uploads"), name)
                     }
                 } else {
-                    tmp.delete()
+                    place = target.label
+                    r = saveToPrivate(ins, delim, target.dir!!, name)
+                }
+                when (r) {
+                    UP_OK -> {
+                        saved.add(name to place)
+                        Diag.log("http", "收到文件 $name → $place")
+                        Audit.record(Audit.FILE, name, "$ip 上传的文件落进 $place")
+                    }
+
+                    UP_DUP -> {
+                        skipped.add(name to "$place 里已有同名文件")
+                        Diag.log("http", "$name 与 $place 里的文件重名，拒绝上传（不覆盖）")
+                        Audit.record(
+                            Audit.FILE, name,
+                            "$ip 上传的 $name 在 $place 里已有同名文件，按重名拒绝，没有覆盖",
+                        )
+                    }
+
+                    else -> Audit.record(Audit.FILE, name, "$ip 上传的 $name 写盘失败，没传成")
                 }
             }
             val after = readLine(ins) ?: break
             if (after.trim().startsWith("--")) break
         }
 
-        if (publicSaved.isEmpty() && privateSaved.isEmpty()) {
+        if (saved.isEmpty() && skipped.isEmpty()) {
             page(out, 400, "没有收到文件")
             return
         }
         val sb = StringBuilder()
         sb.append(docHead("上传完成"))
         sb.append("<h2>上传完成</h2><div class=card>")
-        if (publicSaved.isNotEmpty()) {
-            sb.append("<p class=ok>已保存到设备的公共下载目录 <b>Download/</b>：</p><ul>")
-            for (n in publicSaved) sb.append("<li>${esc(n)}</li>")
+        if (saved.isNotEmpty()) {
+            sb.append("<p class=ok>已上传 ${saved.size} 个：</p><ul>")
+            for ((n, where) in saved) sb.append("<li>${esc(n)} <span class=mut>→ ${esc(where)}</span></li>")
             sb.append("</ul>")
-            sb.append("<p class=mut>这个目录其他应用也看得到：播放器、孩子的教育应用都能直接选到。</p>")
+            if (target.public) {
+                sb.append("<p class=mut>这个目录其他应用也看得到：播放器、孩子的教育应用都能直接选到。</p>")
+            }
         }
-        if (privateSaved.isNotEmpty()) {
-            sb.append("<p class=ok>已保存到应用私有目录 uploads/：</p><ul>")
-            for (n in privateSaved) sb.append("<li>${esc(n)}</li>")
+        if (skipped.isNotEmpty()) {
+            sb.append("<p class=bad>因重名未上传 ${skipped.size} 个：</p><ul>")
+            for ((n, why) in skipped) sb.append("<li>${esc(n)} <span class=mut>（${esc(why)}）</span></li>")
             sb.append("</ul>")
-            sb.append("<p class=mut>这台设备写不了公共下载目录，只能先放这里。</p>")
+            sb.append(
+                "<p class=mut>服务器上没有覆盖、也没有自动改名。" +
+                    "要传这一份，先在自己电脑上把文件名改掉；要换成新的，先在文件列表里把旧的删掉再传。</p>"
+            )
         }
-        sb.append("<p><a class=btn href=\"/?d=${urlEnc(back)}\">返回文件列表</a></p>")
+        sb.append("<p><a class=btn href=\"/?p=${urlEnc(back)}\">返回文件列表</a></p>")
         sb.append("</div>")
         sb.append(foot())
         page(out, html(sb.toString()))
     }
 
-    /** 下载公共下载目录里本应用上传上去的文件，Range 分片照旧支持 */
-    private fun downloadPublic(ctx: Context, req: Req, out: OutputStream, name: String, ip: String) {
-        val row = PublicDownloads.list(ctx).firstOrNull { it.name == name }
-        val stream = PublicDownloads.open(ctx, name)
+    /**
+     * 在当前目录下新建子目录：一个普通表单 POST（字段 name=，建在哪层在 ?p= 里）。
+     * 建完 303 回列表页，结果挂在 done= / err= 上，刷新一下也还在。
+     */
+    private fun mkdir(ctx: Context, req: Req, ins: BackReader, out: OutputStream, ip: String) {
+        val p = normalizePath(parseQuery(req.target.substringAfter('?', ""))["p"].orEmpty())
+        val raw = readBodyField(ins, req, "name").trim()
+        val back = "/?p=${urlEnc(p)}"
+        fun fail(msg: String) {
+            redirect(out, "$back&err=${urlEnc(msg)}")
+        }
+        if (raw.isEmpty()) return fail("目录名不能空着")
+        if (raw == "." || raw == "..") return fail("这个目录名不能用")
+        val name = safeName(raw)
+        val target = resolveTarget(ctx, p) ?: return fail("这个位置建不了目录")
+        if (target.public) {
+            if (!PublicDownloads.mkdir(ctx, target.rel, name)) {
+                return fail("在 Download/ 里建目录没成功——这台设备的系统不认这么建，改传到 files/ 那边试试")
+            }
+        } else {
+            val d = File(target.dir, name)
+            if (d.exists()) return fail("「$name」已经在了")
+            if (!d.mkdir()) return fail("建不了「$name」：设备不允许写这里")
+        }
+        Diag.log("http", "新建目录 $name → ${target.label}")
+        Audit.record(Audit.FILE, name, "$ip 在 ${target.label} 下新建了子目录")
+        redirect(out, "$back&done=${urlEnc("已新建子目录「$name」")}")
+    }
+
+    /** 读一个 x-www-form-urlencoded 请求体里的字段（限长，超了当没给） */
+    private fun readBodyField(ins: BackReader, req: Req, key: String): String {
+        val n = req.headers["content-length"]?.trim()?.toIntOrNull() ?: return ""
+        if (n <= 0 || n > 64 * 1024) return ""
+        val buf = ByteArray(n)
+        var got = 0
+        while (got < n) {
+            val tmp = ByteArray(n - got)
+            val r = try {
+                ins.read(tmp)
+            } catch (_: Exception) {
+                -1
+            }
+            if (r <= 0) break
+            System.arraycopy(tmp, 0, buf, got, r)
+            got += r
+        }
+        return parseQuery(String(buf, 0, got, Charsets.UTF_8))[key].orEmpty()
+    }
+
+    /** 公共下载目录落盘：重名或 MediaStore 走不通分别返回 [UP_DUP] / [UP_FALLBACK] */
+    private fun saveToPublic(ctx: Context, ins: BackReader, delim: ByteArray, rel: String, name: String): Int {
+        if (PublicDownloads.has(ctx, rel, name)) {
+            drainPart(ins, delim)
+            return UP_DUP
+        }
+        val key = "pub:${if (rel.isEmpty()) "" else "$rel/"}$name"
+        if (!inflight.add(key)) {
+            drainPart(ins, delim)
+            return UP_DUP
+        }
+        try {
+            val pub = PublicDownloads.begin(ctx, rel, name, mimeOf(name)) ?: return UP_FALLBACK
+            val stream = PublicDownloads.out(ctx, pub)
+            val ok = try {
+                // 必须套一层缓冲：copyUntil 找分隔符是按字节滑窗的，写出去也是按字节——
+                // 直接怼输出流的话，传一个几十上百 MB 的视频就是几千万次 write 系统调用
+                if (stream == null) false
+                else stream.use { BufferedOutputStream(it, 64 * 1024).use { o -> copyUntil(ins, o, delim) } }
+            } catch (e: Exception) {
+                Diag.log("http", "上传写盘失败：${e.javaClass.simpleName}: ${e.message}")
+                false
+            }
+            if (ok) {
+                PublicDownloads.finish(ctx, pub)
+                return UP_OK
+            }
+            PublicDownloads.abort(ctx, pub)
+            return UP_FAIL
+        } finally {
+            inflight.remove(key)
+        }
+    }
+
+    /**
+     * 私有目录落盘：重名拒绝，先写 .part 再改名（列表页不给看 .part，家长不会下到半截文件）。
+     * 无论走哪条分支，正文都会被读干净，否则后面几段的头会被当成文件内容。
+     */
+    private fun saveToPrivate(ins: BackReader, delim: ByteArray, dir: File, name: String): Int {
+        val dest = File(dir, name)
+        val key = dest.absolutePath
+        // 先看磁盘上有没有，再看有没有别的连接正在写同一个名字——两边都查才不会互相覆盖
+        if (dest.exists() || !inflight.add(key)) {
+            drainPart(ins, delim)
+            return UP_DUP
+        }
+        try {
+            if (!dir.isDirectory && !dir.mkdirs()) {
+                drainPart(ins, delim)
+                return UP_FAIL
+            }
+            val tmp = File(dir, ".upload-${System.nanoTime()}.part")
+            val ok = try {
+                FileOutputStream(tmp).use { fos ->
+                    BufferedOutputStream(fos, 64 * 1024).use { copyUntil(ins, it, delim) }
+                }
+            } catch (e: Exception) {
+                Diag.log("http", "上传写盘失败：${e.javaClass.simpleName}: ${e.message}")
+                false
+            }
+            if (!ok || tmp.length() == 0L) {
+                tmp.delete()
+                return UP_FAIL
+            }
+            if (!tmp.renameTo(dest)) {
+                tmp.delete()
+                return UP_FAIL
+            }
+            return UP_OK
+        } finally {
+            inflight.remove(key)
+        }
+    }
+
+    /** 预检接口：目标目录里已有的名字，浏览器选完文件先拿它标出重名的 */
+    private fun listNames(ctx: Context, out: OutputStream, pArg: String) {
+        val target = resolveTarget(ctx, normalizePath(pArg))
+        if (target == null) {
+            json(out, 404, JSONObject().put("ok", false).put("error", "目标目录不存在"))
+            return
+        }
+        val names = if (target.public) {
+            PublicDownloads.names(ctx, target.rel)
+        } else {
+            target.dir?.listFiles()?.filter { !it.name.startsWith(".") }?.map { it.name } ?: emptyList()
+        }
+        json(
+            out, 200,
+            JSONObject().put("ok", true).put("label", target.label).put("names", JSONArray(names)),
+        )
+    }
+
+    /** 浏览器预检剔掉的那批：JSON 数组 [{"n":名字,"r":原因}] */
+    private fun parseSkipped(v: String, into: MutableList<Pair<String, String>>) {
+        try {
+            val arr = JSONArray(v)
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val n = o.optString("n")
+                if (n.isNotEmpty()) into.add(n to o.optString("r").ifEmpty { "目标目录里已有同名文件" })
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    /** 上传落点：`dl/…` 是公共下载目录下的目录，`files/…` 是私有目录下的目录 */
+    private class Target(val public: Boolean, val dir: File?, val rel: String, val label: String)
+
+    private fun resolveTarget(ctx: Context, p: String): Target? {
+        if (p == LOC_DL || p.startsWith("$LOC_DL/")) {
+            // Android 9 及以下没有 Downloads 集合，这个位置整个用不了
+            if (!PublicDownloads.available()) return null
+            val rel = dlRel(p)
+            val label = if (rel.isEmpty()) "公共下载目录 Download/" else "公共下载目录 Download/$rel/"
+            return Target(true, null, rel, label)
+        }
+        if (p != LOC_FILES && !p.startsWith("$LOC_FILES/")) return null
+        val root = Store.filesRoot(ctx)
+        val rel = filesRel(p)
+        val d = resolve(root, rel) ?: return null
+        if (!d.isDirectory) return null
+        val label = if (rel.isEmpty()) "应用私有目录 files/" else "应用私有目录 files/$rel/"
+        return Target(false, d, rel, label)
+    }
+
+    /**
+     * Content-Disposition 里的表单字段名（没有名字的段返回空串）。
+     * 得跳过 filename=（它自带一个 name=），否则文件段会被当成 dir/skipped 字段。
+     */
+    private fun fieldNameOf(cd: String): String {
+        var from = 0
+        while (true) {
+            val i = cd.indexOf("name=", from)
+            if (i < 0) return ""
+            val isFilename = i >= 4 && cd.startsWith("filename=", i - 4)
+            if (!isFilename) return cd.substring(i + "name=".length).trim().substringBefore(';').trim().trim('"')
+            from = i + "name=".length
+        }
+    }
+
+    /** 读一个普通表单字段的值（限长，超长部分照样读到分隔符为止、只是不留） */
+    private fun readField(ins: BackReader, delim: ByteArray, cap: Int = 256 * 1024): String {
+        val buf = ByteArrayOutputStream()
+        val sink = object : OutputStream() {
+            override fun write(b: Int) {
+                if (buf.size() < cap) buf.write(b)
+            }
+
+            override fun write(b: ByteArray, off: Int, len: Int) {
+                if (buf.size() < cap) buf.write(b, off, minOf(len, cap - buf.size()))
+            }
+        }
+        copyUntil(ins, sink, delim)
+        return buf.toString("UTF-8")
+    }
+
+    /** 重名的段落不写盘，但正文必须从连接里读干净，不然下一段的头会被当成文件内容 */
+    private fun drainPart(ins: BackReader, delim: ByteArray) {
+        copyUntil(ins, nullSink, delim)
+    }
+
+    /** 下载公共下载目录里本应用上传上去的文件（rel 是 Download 下的目录），Range 分片照旧支持 */
+    private fun downloadPublic(
+        ctx: Context,
+        req: Req,
+        out: OutputStream,
+        rel: String,
+        name: String,
+        ip: String,
+    ) {
+        val row = PublicDownloads.listAt(ctx, rel).firstOrNull { it.name == name && !it.dir }
+        val stream = PublicDownloads.open(ctx, rel, name)
         if (row == null || stream == null) {
             page(out, 404, "文件不存在")
             return
@@ -799,20 +1244,6 @@ object HttpGateway {
         return v
     }
 
-    private fun uniqueName(dir: File, name: String): File {
-        var f = File(dir, name)
-        if (!f.exists()) return f
-        val dot = name.lastIndexOf('.')
-        val base = if (dot > 0) name.substring(0, dot) else name
-        val ext = if (dot > 0) name.substring(dot) else ""
-        var n = 1
-        while (f.exists() && n < 1000) {
-            f = File(dir, "$base($n)$ext")
-            n++
-        }
-        return f
-    }
-
     /** 把相对路径解析到根目录下；越界（../）或不存在都返回 null */
     private fun resolve(root: File, rel: String): File? {
         val clean = rel.replace('\\', '/').trimStart('/')
@@ -824,12 +1255,6 @@ object HttpGateway {
         } catch (_: Exception) {
             null
         }
-    }
-
-    private fun relOf(root: File, f: File): String = try {
-        f.canonicalFile.toRelativeString(root.canonicalFile).replace(File.separatorChar, '/').trim('/')
-    } catch (_: Exception) {
-        ""
     }
 
     private fun parseQuery(s: String): Map<String, String> {
@@ -924,6 +1349,12 @@ object HttpGateway {
         body(out, b)
     }
 
+    /** 303 回另一页：表单提交完用，刷新不会重复提交 */
+    private fun redirect(out: OutputStream, to: String) {
+        head(out, 303, "text/plain; charset=utf-8", listOf("Location" to to))
+        body(out, ByteArray(0))
+    }
+
     private fun head(out: OutputStream, code: Int, type: String, extra: List<Pair<String, String>> = emptyList()) {
         val reason = when (code) {
             200 -> "OK"; 303 -> "See Other"; 400 -> "Bad Request"; 404 -> "Not Found"
@@ -943,6 +1374,13 @@ object HttpGateway {
         out.flush()
     }
 
+    /** 给页面里的 fetch 用的 JSON 响应 */
+    private fun json(out: OutputStream, code: Int, obj: JSONObject) {
+        val b = obj.toString().toByteArray(Charsets.UTF_8)
+        head(out, code, "application/json; charset=utf-8", listOf("Content-Length" to b.size.toString()))
+        body(out, b)
+    }
+
     private fun css(): String = """
         <style>
         body{font-family:-apple-system,'Segoe UI',Roboto,'Noto Sans SC',sans-serif;margin:0;padding:24px;background:#f5f7fb;color:#1b2431}
@@ -955,9 +1393,21 @@ object HttpGateway {
         a{color:#2b6cff;text-decoration:none}a:hover{text-decoration:underline}
         .btn{background:#eef3ff;border-radius:8px;padding:6px 12px;font-size:13px;display:inline-block}
         .up{background:#fff;border-radius:12px;padding:16px;max-width:900px}
+        .bad{color:#e03131;font-weight:bold}
+        .urow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+        select{font-size:14px;padding:8px 10px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;max-width:100%}
+        label{color:#4b5563;font-size:14px}
         button{background:#2b6cff;color:#fff;border:0;border-radius:8px;padding:9px 18px;font-size:14px;cursor:pointer}
         button:disabled{background:#9db4e8;cursor:default}
         input[type=file]{font-size:14px;margin-right:8px}
+        .q[hidden]{display:none}
+        .q{margin:4px 0 12px;border:1px solid #e6ecf7;border-radius:10px;overflow:hidden;max-width:640px}
+        .q .qrow{display:flex;gap:10px;align-items:center;padding:7px 12px;border-bottom:1px solid #f2f5fa;font-size:13px}
+        .q .qrow:last-child{border-bottom:0}
+        .q .qname{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .q .qstat{font-size:12px;color:#2f9e44}
+        .q .qstat.bad{color:#e03131}
+        .q .qfoot{padding:7px 12px;background:#fff5f5;color:#e03131;font-size:12px}
         .prog[hidden]{display:none}
         .prog{margin-top:14px;max-width:520px}
         .track{height:8px;background:#e6ecf7;border-radius:99px;overflow:hidden}
@@ -983,29 +1433,86 @@ object HttpGateway {
      *
      * 没有 XHR/FormData 的老浏览器直接 return，退回原生表单提交——只是没有进度可看，功能照旧。
      */
-    private fun uploadScript(): String = """
+    private fun uploadScript(p: String, where: String): String = """
 <script>
 (function(){
   var form=document.getElementById('upform');
-  if(!form || !window.XMLHttpRequest || !window.FormData) return;
-  var file=document.getElementById('upfile'), btn=document.getElementById('upbtn');
+  if(!form) return;
+  var file=document.getElementById('upfile'), btn=document.getElementById('upbtn'), sel=document.getElementById('updir');
   var box=document.getElementById('upprog'), fill=document.getElementById('upfill'), txt=document.getElementById('uptext');
+  var q=document.getElementById('upq');
+  var P=${JSONObject.quote(p)}, WHERE=${JSONObject.quote(where)};
+  var canXhr=!!(window.XMLHttpRequest && window.FormData);
+  var dups={};
   function size(n){
     if(n<1024) return n+' B';
     if(n<1048576) return (n/1024).toFixed(1)+' KB';
     if(n<1073741824) return (n/1048576).toFixed(1)+' MB';
     return (n/1073741824).toFixed(2)+' GB';
   }
+  function esc(s){
+    return String(s).replace(/[&<>"']/g, function(c){
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+    });
+  }
   function fail(msg){
     box.className='prog bad';
     txt.textContent=msg;
     btn.disabled=false; file.disabled=false;
   }
+  // 快捷切换：选一个目录就整页跳过去，浏览到哪一层就传到哪一层。
+  // 没开 JS 的浏览器下拉框会跟着表单提交（字段名 dir），服务端也认。
+  if(sel){
+    sel.onchange=function(){
+      if(!sel.value) return;
+      location.href='/?p='+encodeURIComponent(sel.value);
+    };
+  }
+  // 选完文件先问一遍目标目录里已有哪些名字，重名的当场标出来、不往上传队列里放，
+  // 免得家长传一个几百 MB 的视频等半天才被告知重名。
+  function render(names, existing){
+    var seen={}, i, dupN=0, rows='';
+    for(i=0;i<names.length;i++){
+      var nm=names[i], why='';
+      if(seen[nm]) why='本次选择里有同名文件';
+      else if(existing.indexOf(nm)>=0) why='目标目录里已有同名文件';
+      seen[nm]=1;
+      if(why){
+        dupN++; dups[nm]=why;
+        rows+='<div class=qrow><span class=qname title="'+esc(nm)+'">'+esc(nm)+'</span><span class="qstat bad">重名，跳过</span></div>';
+      }else{
+        delete dups[nm];
+        rows+='<div class=qrow><span class=qname title="'+esc(nm)+'">'+esc(nm)+'</span><span class=qstat>可上传</span></div>';
+      }
+    }
+    q.innerHTML = rows + (dupN ? '<div class=qfoot>'+dupN+' 个文件在 '+esc(WHERE)+' 里已有同名，不会被上传；要传请先改名</div>' : '');
+    q.hidden=false;
+  }
+  function precheck(){
+    if(!file.files || !file.files.length){ q.hidden=true; dups={}; return; }
+    if(!window.fetch) return;
+    var names=[], i;
+    for(i=0;i<file.files.length;i++) names.push(file.files[i].name);
+    fetch('/ls?p='+encodeURIComponent(P)).then(function(r){ return r.json(); }).then(function(j){
+      render(names, (j && j.names) || []);
+    }, function(){ render(names, []); });
+  }
+  file.addEventListener('change', precheck);
   form.addEventListener('submit', function(ev){
     if(!file.files || !file.files.length) return; // 没选文件就交给服务端回「没有收到文件」
+    if(!canXhr) return;                           // 老浏览器退回原生表单提交：没有进度条，服务端照样查重名
     ev.preventDefault();
-    var i, total=0, fd=new FormData();
-    for(i=0;i<file.files.length;i++){ fd.append('f', file.files[i]); total+=file.files[i].size; }
+    var i, total=0, fd=new FormData(), skipped=[], names=[];
+    for(i=0;i<file.files.length;i++){
+      var f=file.files[i];
+      if(dups[f.name]){ skipped.push({n:f.name, r:dups[f.name]}); names.push(f.name); }
+      else { fd.append('f', f); total+=f.size; }
+    }
+    fd.append('skipped', JSON.stringify(skipped));
+    if(total===0){
+      fail('选中的 '+names.length+' 个文件在 '+WHERE+' 里都已有同名，一个都没传：'+names.join('、'));
+      return;
+    }
     var xhr=new XMLHttpRequest();
     xhr.open('POST', form.getAttribute('action'), true);
     var last=Date.now(), lastBytes=0;
@@ -1023,7 +1530,7 @@ object HttpGateway {
         last=now; lastBytes=e.loaded;
       }
       fill.style.width=pct+'%';
-      txt.textContent=(pct>=100 ? '已传完，设备正在写入 Download/ …' : '正在上传 '+pct+'%')
+      txt.textContent=(pct>=100 ? '已传完，设备正在写入 '+WHERE+' …' : '正在上传 '+pct+'%')
         +'  ·  '+size(e.loaded)+' / '+size(tot)+speed;
     };
     xhr.onload=function(){
@@ -1072,10 +1579,15 @@ object HttpGateway {
         sb.appendLine("日志文件：${Diag.logFile(ctx)}")
         sb.appendLine("行为审计文件：${Audit.file(ctx)}（连上浏览器后在 logs/ 里点它就能下载）")
         sb.appendLine(
-            "上传落点：" + if (PublicDownloads.available()) {
-                "设备的公共下载目录 Download/（其他应用也能看到），已上传 ${PublicDownloads.list(ctx).size} 个"
+            "网页目录：根那层是 Download/（公共下载目录）和 files/（应用私有目录）两个位置，" +
+                "都能进子目录、回上一级、新建子目录；浏览到哪一层就把文件传到哪一层，" +
+                "重名文件一律拒绝上传、不覆盖，传完单独列出未上传的重名清单"
+        )
+        sb.appendLine(
+            "公共下载目录：" + if (PublicDownloads.available()) {
+                "本应用放过 ${PublicDownloads.total(ctx)} 个文件（其他应用也能看到）"
             } else {
-                "Android 9 及以下写不了公共目录，落在私有 uploads/"
+                "Android 9 及以下写不了公共下载目录，只能用 files/"
             }
         )
         sb.appendLine("已同意的设备：${Store.approvedIps(ctx).joinToString(" / ").ifEmpty { "（还没有）" }}")
