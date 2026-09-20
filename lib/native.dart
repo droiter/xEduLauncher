@@ -53,6 +53,28 @@ class HomeSettingsResult {
   };
 }
 
+/// 无障碍此刻的实况（桌面顶部那行状态显示的就是它）。
+/// 两个字段分开看，因为它们坏的方式不一样：家长在系统里关掉的是 [enabled]，
+/// 而装新版/强行停止/厂商省电休眠杀掉服务时，[enabled] 还显示着打开、只有 [running] 变 false。
+class AccessibilityStatus {
+  /// 系统「无障碍」列表里开着
+  final bool enabled;
+
+  /// 服务实例真的活着
+  final bool running;
+
+  const AccessibilityStatus({required this.enabled, required this.running});
+
+  factory AccessibilityStatus.fromMap(Map<dynamic, dynamic> m) =>
+      AccessibilityStatus(
+        enabled: m['enabled'] as bool? ?? false,
+        running: m['running'] as bool? ?? false,
+      );
+
+  /// 管控真的在生效吗——限时、前台守护、任务键、回到桌面挑战全靠这个权限
+  bool get ok => enabled && running;
+}
+
 /// 与 Android 原生侧的 MethodChannel 封装。
 /// iOS / 鸿蒙若要适配，只需在此层替换实现，UI 层不受影响。
 class Native {
@@ -73,6 +95,12 @@ class Native {
   static final ValueNotifier<HomeSettingsResult?> homeResult =
       ValueNotifier<HomeSettingsResult?>(null);
 
+  /// 无障碍实况。[null] = 还没问到，此时界面不报警——原生侧答不上来就喊"权限没了"
+  /// 是误报，家长会照着去开关一遍。原生侧在服务连上/断开的那一刻主动推（[onAccessibilityChanged]），
+  /// 界面回前台时再查一次兜底。
+  static final ValueNotifier<AccessibilityStatus?> accessibility =
+      ValueNotifier<AccessibilityStatus?>(null);
+
   static void init() {
     _ch.setMethodCallHandler((call) async {
       switch (call.method) {
@@ -84,6 +112,10 @@ class Native {
           homeResult.value = HomeSettingsResult.fromMap(
             (call.arguments as Map?) ?? const {},
           );
+        case 'onAccessibilityChanged':
+          accessibility.value = AccessibilityStatus.fromMap(
+            (call.arguments as Map?) ?? const {},
+          );
       }
       return null;
     });
@@ -91,6 +123,19 @@ class Native {
 
   static Future<LauncherConfig> config() async =>
       LauncherConfig.fromMap(await _ch.invokeMethod('config') ?? {});
+
+  /// 无障碍实况。查到就顺手写进 [accessibility]，界面监听那一个就够了。
+  /// 原生侧没答上来（返回 null）时**什么都不改**：一次异常查询不该把已经知道的
+  /// "开着"抹掉，更不该凭空冒出一条红字警告。
+  static Future<void> refreshAccessibility() async {
+    try {
+      final raw = await _ch.invokeMethod<Map<dynamic, dynamic>>('accessibilityStatus');
+      if (raw != null) accessibility.value = AccessibilityStatus.fromMap(raw);
+    } catch (_) {
+      // 查不到就维持上一次的结论。它只是界面上的一行提示，
+      // 绝不能因为它把 config/listApps 那批真正要用的加载带崩
+    }
+  }
 
   /// 只提交需要修改的字段
   static Future<LauncherConfig> updateConfig(Map<String, dynamic> patch) async =>

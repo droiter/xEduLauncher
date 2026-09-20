@@ -128,6 +128,8 @@ class GuardAccessibilityService : AccessibilityService() {
         addOverlay()
         Diag.log("guard", "前台守护服务已连接（无障碍）")
         Audit.record(Audit.SERVICE, "前台守护", "无障碍服务已连接：开始拦非白名单应用、计时、看窗口链")
+        // 桌面顶部那行状态要立刻从红变绿，不能等家长下一次回桌面才发现
+        MainActivity.pushAccessibilityStatus(this)
     }
 
     override fun onDestroy() {
@@ -137,9 +139,10 @@ class GuardAccessibilityService : AccessibilityService() {
         removeOverlay()
         if (instance === this) instance = null
         // 这条日志是「限时为什么又不生效」的答案所在：服务一没，单次计时、前台守护、
-        // 任务键拦截、回到桌面挑战全都跟着停，而桌面上看不出来
+        // 任务键拦截、回到桌面挑战全都跟着停。桌面顶部那行状态也靠这次推送变红
         Diag.log("guard", "前台守护服务断开（限时/前台守护/任务键/回到桌面挑战随之全部失效）")
         Audit.record(Audit.SERVICE, "前台守护", "无障碍服务断开：限时/前台守护/任务键/回到桌面挑战全部失效")
+        MainActivity.pushAccessibilityStatus(this)
         super.onDestroy()
     }
 
@@ -378,6 +381,32 @@ class GuardAccessibilityService : AccessibilityService() {
 
     /** 退掉最近任务那一屏，让孩子留在当前应用里 */
     private fun killTaskScreen(pkg: String, cls: String) {
+        // 桌面自己正站在最前面时，**别的**桌面（系统那个原厂 launcher）冒出来的窗口不是「孩子按了任务键」，
+        // 而是系统切桌面时的过渡窗口。这种时候发返回键有两个后果，2026-09-20 模拟器实测都撞上了：
+        // ① 那一下返回键打在桌面刚弹出来的挑战框上（Flutter 对话框的返回键会把它 pop 掉）→
+        //    孩子按 Home 看到的挑战框一闪就被判「没通过」→ 又被送回应用里，桌面永远进不去；
+        // ② 紧接着桌面这边还会把 taskReturn 当成「刚退掉最近任务」，再送他回去一次，来回弹。
+        // 本应用自己的包名那一支（三星手势导航下最近任务由本桌面渲染）不受影响，照旧退。
+        // 另一条更要紧：本应用自己的整屏页面（密码页/乘法挑战页/同意页）正开着时不发返回键——
+        // 那几个页面一起来，系统切任务时的过渡窗口也会被当成「最近任务」，而这一下返回键
+        // 落在哪由系统定、不是我们能挑的：密码页正在最前面，挨的就是它
+        // （2026-09-20 模拟器实测：限时到点弹出的密码页 0.6 秒后自己消失，孩子按一下就到手了）。
+        if (overlayShowing()) {
+            Diag.log(
+                "guard",
+                "任务键：$pkg/${cls.substringAfterLast('.')} 露头，但本应用自己的页面（密码页/挑战页/同意页）正开着，" +
+                    "这一下不发返回键（怕打在自己页面上）",
+            )
+            return
+        }
+        if (pkg != packageName && MainActivity.onScreen) {
+            Diag.log(
+                "guard",
+                "任务键：$pkg/${cls.substringAfterLast('.')} 露头，但本应用桌面正站在最前面，" +
+                    "这一下不当任务键处理（多半是系统切桌面的过渡窗口）",
+            )
+            return
+        }
         val now = SystemClock.elapsedRealtime()
         lastTaskKillAt = now
         lastTaskKillPkg = pkg
@@ -848,6 +877,12 @@ class GuardAccessibilityService : AccessibilityService() {
         /** 当前活着的那个服务实例。计时状态就在它身上，挑战页和桌面通过下面几个口子找它 */
         @Volatile
         private var instance: GuardAccessibilityService? = null
+
+        /**
+         * 服务实例是否活着。和系统「无障碍」列表里那个开关是两回事：开关开着而服务被杀掉
+         * （装新版、强行停止、厂商省电休眠）时这个仍是 false，桌面顶部要照实报出来。
+         */
+        fun isRunning(): Boolean = instance != null
 
         /** 乘法挑战页答完题后的结局 */
         fun onChallengeAnswered(ok: Boolean) {

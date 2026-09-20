@@ -1,11 +1,16 @@
 package com.ccbridge.child_launcher
 
 import android.app.Activity
+import android.os.Build
 import android.os.Bundle
 import android.text.InputType
+import android.view.View
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
+import android.window.OnBackInvokedDispatcher
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 
 /**
  * 超时 / 超次数时全屏弹出的密码页。用原生 Activity 实现，
@@ -43,6 +48,27 @@ class LockActivity : Activity() {
 
         input.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
         findViewById<Button>(R.id.lockOk).setOnClickListener { tryUnlock(reason, input, hint) }
+        // 键盘上的确认键（✓ / 回车）也要能提交。这一页是整屏居中的，键盘一顶上来「确认」按钮
+        // 就压在键盘底下了：家长输完密码按键盘上的 ↵ 只会把键盘收掉，什么都不会发生
+        // （2026-09-20 模拟器实测），得再点一次按钮。两条路都通最省事。
+        input.setOnEditorActionListener { _, _, _ ->
+            tryUnlock(reason, input, hint)
+            true
+        }
+        // 键盘顶上来时把整页往上抬：targetSdk 35+ 强制 edge-to-edge 之后，清单里写 adjustResize
+        // 已经不管用了，得自己吃 IME 那个高度
+        ViewCompat.setOnApplyWindowInsetsListener(findViewById<View>(R.id.lockRoot)) { v, insets ->
+            v.setPadding(0, 0, 0, insets.getInsets(WindowInsetsCompat.Type.ime()).bottom)
+            insets
+        }
+        // 这一页只能靠密码出去，返回键一律吞掉——包括无障碍服务发的那种全局返回手势
+        // （GLOBAL_ACTION_BACK 走的是手势那条路，实测能把这一页关掉；下面 onBackPressed 那一条
+        // 只挡得住真的按返回键）。targetSdk 33 起要用这个回调才算数
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+            ) { Diag.log("gate", "密码页吞掉了一次返回（这一页只能靠密码关掉）") }
+        }
         input.requestFocus()
     }
 

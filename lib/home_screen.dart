@@ -30,6 +30,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     Native.homeKey.addListener(_onHomeKey);
     Native.backEscape.addListener(_onBackEscape);
+    // 无障碍连上/断开时原生侧会主动推过来，顶部那行状态当场跟着变
+    Native.accessibility.addListener(_onAccessibilityChanged);
     _reload().then((_) async {
       final cfg = _cfg;
       if (cfg == null) return;
@@ -52,6 +54,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void dispose() {
     Native.homeKey.removeListener(_onHomeKey);
     Native.backEscape.removeListener(_onBackEscape);
+    Native.accessibility.removeListener(_onAccessibilityChanged);
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -60,6 +63,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     // 从别的应用切回桌面时刷新一次统计数据
     if (state == AppLifecycleState.resumed) _reload();
+  }
+
+  /// 无障碍实况变了（原生侧推的，或某次刷新查到的），顶部那行跟着重画
+  void _onAccessibilityChanged() {
+    if (mounted) setState(() {});
   }
 
   /// 原生侧只在「孩子从别的应用逃回桌面」时通知这里（守护自己弹回桌面的那次不通知），
@@ -97,7 +105,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _reload() async {
-    final results = await Future.wait([Native.config(), Native.listApps()]);
+    final results = await Future.wait([
+      Native.config(),
+      Native.listApps(),
+      Native.refreshAccessibility(),
+    ]);
     final cfg = results[0] as LauncherConfig;
     // 图标跟列表一起就绪再上屏，免得磁贴先从字母闪成图标
     final icons = await Native.appIcons(cfg.allowed);
@@ -217,6 +229,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             parts.join(' · '),
             style: TextStyle(color: Theme.of(context).hintColor, fontSize: 14),
           ),
+          const SizedBox(height: 8),
+          _accessibilityLine(),
           if (!cfg.isDefaultLauncher)
             Padding(
               padding: const EdgeInsets.only(top: 6),
@@ -227,6 +241,28 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ),
         ],
       ),
+    );
+  }
+
+  /// 顶部那行「无障碍还在不在」。这是家长装完之后唯一的现场提示——他不会天天进设置页，
+  /// 而服务被系统悄悄杀掉时（装新版、强行停止、厂商省电休眠）桌面上本来什么都看不出来，
+  /// 只会觉得"限时怎么又不管用了"。还没问到实况（[AccessibilityStatus] 为 null）时什么都不显示：
+  /// 原生侧答不上来就报"权限没了"是误报。
+  Widget _accessibilityLine() {
+    final acc = Native.accessibility.value;
+    if (acc == null) return const SizedBox.shrink();
+    if (acc.ok) {
+      return Text(
+        '无障碍守护：已开启',
+        style: TextStyle(color: Colors.green.shade700, fontSize: 13),
+      );
+    }
+    return _BlinkingWarning(
+      text: acc.enabled
+          ? '⚠ 无障碍已开启，但服务没在运行：限时、前台守护、回到桌面挑战都不会生效\n'
+                '请到「家长设置 → 防绕过 → 无障碍权限」里关掉再打开一次'
+          : '⚠ 无障碍权限未开启：限时、前台守护、回到桌面挑战都不会生效\n'
+                '请到「家长设置 → 防绕过 → 无障碍权限」里打开',
     );
   }
 
@@ -305,6 +341,49 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       ),
       itemCount: tiles.length,
       itemBuilder: (_, i) => tiles[i],
+    );
+  }
+}
+
+/// 红字闪烁警告。
+/// 用 [FadeTransition] 而不是定时 setState：桌面是常驻界面，为了闪烁每 600ms 重建一次
+/// 整棵子树没必要，动画只重绘这一层。**只要它上屏，就会一直有帧在排**——写测试时
+/// 别对它用 pumpAndSettle，那会永远等不到静止（用 tester.pump(时长) 往前推）。
+class _BlinkingWarning extends StatefulWidget {
+  const _BlinkingWarning({required this.text});
+
+  final String text;
+
+  @override
+  State<_BlinkingWarning> createState() => _BlinkingWarningState();
+}
+
+class _BlinkingWarningState extends State<_BlinkingWarning>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 700),
+  )..repeat(reverse: true);
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FadeTransition(
+      // 不闪到全透明：家长扫一眼过来的时候字得还看得见
+      opacity: Tween<double>(begin: 1, end: 0.25).animate(_c),
+      child: Text(
+        widget.text,
+        style: TextStyle(
+          color: Colors.red.shade700,
+          fontSize: 13,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
     );
   }
 }

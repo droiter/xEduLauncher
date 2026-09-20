@@ -82,34 +82,41 @@ class _MathDialogState extends State<_MathDialog> {
 
   @override
   Widget build(BuildContext context) {
-    return _Shell(
-      icon: Icons.calculate_outlined,
-      title: widget.title,
-      subtitle: '算对了才能继续，只有一次机会',
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text(
-            widget.prompt,
-            style: const TextStyle(fontSize: 44, fontWeight: FontWeight.bold),
-          ),
-          const SizedBox(height: 20),
-          TextField(
-            controller: _controller,
-            autofocus: true,
-            keyboardType: TextInputType.number,
-            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-            textAlign: TextAlign.center,
-            style: const TextStyle(fontSize: 30),
-            decoration: const InputDecoration(
-              hintText: '答案',
-              border: OutlineInputBorder(),
+    // 返回键不许把这一页 pop 掉：对话框被 pop 就等于返回 null，也就是「没通过」，
+    // 孩子会被直接送回应用里——而这一页本来就没有「取消」这条退路（见 _submit）。
+    // 这一下返回键未必是孩子按的：守护退「最近任务」那一屏时会发一个 GLOBAL_ACTION_BACK，
+    // 它落在哪个窗口上不由我们决定，2026-09-20 模拟器实测就打在过这个对话框上。
+    return PopScope(
+      canPop: false,
+      child: _Shell(
+        icon: Icons.calculate_outlined,
+        title: widget.title,
+        subtitle: '算对了才能继续，只有一次机会',
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              widget.prompt,
+              style: const TextStyle(fontSize: 44, fontWeight: FontWeight.bold),
             ),
-            onSubmitted: (_) => _submit(),
-          ),
-          const SizedBox(height: 20),
-          _Actions(onOk: _submit),
-        ],
+            const SizedBox(height: 20),
+            TextField(
+              controller: _controller,
+              autofocus: true,
+              keyboardType: TextInputType.number,
+              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 30),
+              decoration: const InputDecoration(
+                hintText: '答案',
+                border: OutlineInputBorder(),
+              ),
+              onSubmitted: (_) => _submit(),
+            ),
+            const SizedBox(height: 20),
+            _Actions(onOk: _submit),
+          ],
+        ),
       ),
     );
   }

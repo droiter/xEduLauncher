@@ -2,6 +2,7 @@ package com.ccbridge.child_launcher
 
 import android.Manifest
 import android.app.role.RoleManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
@@ -56,7 +57,10 @@ class MainActivity : FlutterActivity() {
      */
     private var coveredByOwnPage = false
 
-    /** 本 Activity 此刻是否在前台。只作为判定的兜底依据之一 */
+    /**
+     * 本 Activity 此刻是否在前台。只作为判定的兜底依据之一。
+     * 同一个值也往 [onScreen] 里写一份给无障碍服务用（同一个进程，见 [GuardAccessibilityService.killTaskScreen]）
+     */
     private var inForeground = false
 
     /** 上一次观察到的默认桌面状态，只在变化时写日志，免得刷屏 */
@@ -94,6 +98,7 @@ class MainActivity : FlutterActivity() {
         super.configureFlutterEngine(flutterEngine)
         val ch = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
         channel = ch
+        liveChannel = ch
         ch.setMethodCallHandler { call, result -> handle(call.method, call.arguments, result) }
     }
 
@@ -239,6 +244,7 @@ class MainActivity : FlutterActivity() {
     override fun onResume() {
         super.onResume()
         inForeground = true
+        onScreen = true
         // 这一下露面是不是「刚退掉最近任务那一屏」造成的？三星手势导航下，从多任务视图按返回
         // 会落到桌面上，孩子并不是想回桌面——那一下返回键是本应用发的。取到了就直接把他送回
         // 刚才那个应用，不弹挑战框（家长要的是「任务键＝留在当前应用」）。
@@ -298,10 +304,13 @@ class MainActivity : FlutterActivity() {
 
     override fun onPause() {
         inForeground = false
+        onScreen = false
         leftForegroundAt = SystemClock.elapsedRealtime()
         // 盖上来的是本应用自己的家长页面（密码页/同意页）吗？是的话这一次离开前台不算
         // 「他离开桌面去了别处」，见 coveredByOwnPage。**不包含乘法挑战页**：那一页是从
-        // 孩子正在用的应用上弹出来的，它上面的 Home 就是「从应用里逃回来」，照旧要判
+        // 孩子正在用的应用上弹出来的，它上面的 Home 就是「从应用里逃回来」，照旧要判。
+        // 这两个 showing 标记是在 startActivity **之前**就立起来的（Store.showLock /
+        // HttpGateway.askConsent）：onPause 跑在对方 onCreate 之前，等它们自己置位读到的是 false
         coveredByOwnPage = LockActivity.showing || HttpConsentActivity.showing
         // 桌面要离开前台了：下一次回到最前面算一次新露面，得重新判（见 judgeAppearance）。
         // 孩子站在桌面上按 Home 不经过这里，所以那一下不会被当成一次新露面
@@ -428,6 +437,8 @@ class MainActivity : FlutterActivity() {
             // 清空历史日志。清完不回报告：报告一生成又会写一份文件、还多两条记录，
             // 家长看到「刚清完 logs/ 里就有东西」会以为没清干净——他要的是从此刻起重新记
             "launcherDiagClear" -> result.success(Diag.clearAll(this))
+            // 桌面顶部那行实时状态用。界面上「无障碍还开着吗」这件事，以前只有自检报告里能查到
+            "accessibilityStatus" -> result.success(accessibilityStatusMap(this))
             "openSystemSettings" -> {
                 leaveLauncherFor(
                     Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
@@ -919,6 +930,14 @@ class MainActivity : FlutterActivity() {
         private const val REQ_HOME_ROLE = 201
 
         /**
+         * 桌面此刻是不是就在屏幕上（onResume/onPause 维护）。
+         * 无障碍服务和桌面在同一个进程里，守护退「最近任务」那一屏之前问这一句，
+         * 免得把系统那个原厂桌面露的一下窗口当成「孩子按了任务键」，见 GuardAccessibilityService.killTaskScreen。
+         */
+        @Volatile
+        var onScreen = false
+
+        /**
          * 「这一下按 Home 造成的现场变化」都在这么新以内，不作数。按 Home 会把桌面拉到最前、
          * 把 Activity 暂停/重建，这些变化就发生在毫秒前；只有比这更早就成立的状态才算「他本来就在桌面上」。
          */
@@ -933,6 +952,33 @@ class MainActivity : FlutterActivity() {
 
         /** 图标统一编码成这么大，够桌面磁贴用，又不至于把通道塞爆 */
         private const val ICON_PX = 128
+
+        /**
+         * 最新一次建起来的界面通道。无障碍服务是进程级的东西，它连上/断开时手里没有
+         * Activity 实例，只能从静态处拿到通道把状态推回界面。
+         */
+        private var liveChannel: MethodChannel? = null
+
+        /**
+         * 无障碍此刻的实况，桌面顶部那行状态照这个显示。故意分成两件事：
+         * `enabled` 是系统「无障碍」列表里的开关（家长能直接看到的那个），
+         * `running` 是服务实例真的活着——开关开着 ≠ 在跑，装新版、强行停止、
+         * 厂商省电休眠都会把服务杀掉而不改那个开关（第 24 条那种"限时没生效"就是这么来的）。
+         */
+        fun accessibilityStatusMap(ctx: Context): Map<String, Any> = mapOf(
+            "enabled" to Store.accessibilityOn(ctx),
+            "running" to GuardAccessibilityService.isRunning(),
+        )
+
+        /** 服务连上/断开的那一下立刻推给界面，不用等下一次刷新（这就是"实时"的来源） */
+        fun pushAccessibilityStatus(ctx: Context) {
+            val ch = liveChannel ?: return
+            try {
+                ch.invokeMethod("onAccessibilityChanged", accessibilityStatusMap(ctx))
+            } catch (e: Exception) {
+                Diag.log("guard", "无障碍状态推给界面失败：${e.javaClass.simpleName}: ${e.message}")
+            }
+        }
 
         /** Activity 最后一次离开前台的时刻。进程级：Activity 被重建时，那是上一个实例留下的 */
         private var leftForegroundAt = 0L

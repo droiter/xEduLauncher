@@ -33,6 +33,10 @@ void _mock(
   bool coldStartHome = false,
   bool chOnHome = true,
   Future<void>? configGate,
+  AccessibilityStatus accessibility = const AccessibilityStatus(
+    enabled: true,
+    running: true,
+  ),
 }) {
   TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
       .setMockMethodCallHandler(_channel, (call) async {
@@ -47,6 +51,8 @@ void _mock(
             ];
           case 'appIcons':
             return icons;
+          case 'accessibilityStatus':
+            return {'enabled': accessibility.enabled, 'running': accessibility.running};
           case 'returnToLastApp':
             return true;
         }
@@ -82,6 +88,87 @@ Future<Uint8List> _png(WidgetTester tester) async {
 }
 
 void main() {
+  setUp(() {
+    // Native.accessibility 是静态的，上一个用例留下的结论会串到下一个用例里
+    Native.accessibility.value = null;
+  });
+
+  testWidgets('无障碍开着时顶部显示「已开启」，不报警', (tester) async {
+    _mock('com.acc.ok', const {});
+    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+    await tester.pumpAndSettle();
+
+    expect(find.text('无障碍守护：已开启'), findsOneWidget);
+    expect(find.textContaining('无障碍权限未开启'), findsNothing);
+  });
+
+  testWidgets('缺无障碍权限时顶部红字闪烁警告', (tester) async {
+    _mock(
+      'com.acc.off',
+      const {},
+      accessibility: const AccessibilityStatus(enabled: false, running: false),
+    );
+    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+    // 警告一上屏就有动画在排，这里不能 pumpAndSettle（永远等不到静止），手动往前推
+    await tester.pump();
+    await tester.pump();
+
+    expect(find.textContaining('无障碍权限未开启'), findsOneWidget);
+    expect(find.textContaining('家长设置 → 防绕过'), findsOneWidget, reason: '要告诉家长去哪打开');
+
+    double opacity() => tester
+        .widget<FadeTransition>(
+          find
+              .ancestor(
+                of: find.textContaining('无障碍权限未开启'),
+                matching: find.byType(FadeTransition),
+              )
+              .first,
+        )
+        .opacity
+        .value;
+
+    final a = opacity();
+    await tester.pump(const Duration(milliseconds: 350));
+    expect(opacity(), isNot(closeTo(a, 0.01)), reason: '红字得真的在闪');
+  });
+
+  testWidgets('系统里开着但服务没在跑，也是红字警告（装新版/被系统杀掉那种）', (tester) async {
+    _mock(
+      'com.acc.dead',
+      const {},
+      accessibility: const AccessibilityStatus(enabled: true, running: false),
+    );
+    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+    await tester.pump();
+    await tester.pump();
+
+    expect(find.textContaining('无障碍已开启，但服务没在运行'), findsOneWidget);
+  });
+
+  testWidgets('原生侧还没答上来时不报警，免得误报', (tester) async {
+    _mock('com.acc.unknown', const {});
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(_channel, (call) async {
+          switch (call.method) {
+            case 'config':
+              return _config('com.acc.unknown');
+            case 'listApps':
+              return [
+                {'package': 'com.acc.unknown', 'label': '计算器'},
+              ];
+            case 'appIcons':
+              return const <String, Uint8List>{};
+          }
+          // accessibilityStatus 没实现 → 返回 null = 查不到
+          return null;
+        });
+    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('无障碍'), findsNothing);
+  });
+
   testWidgets('孩子本来就站在桌面上时，返回键不弹挑战框', (tester) async {
     _mock('com.back', const {});
     await tester.pumpWidget(const MaterialApp(home: HomeScreen()));

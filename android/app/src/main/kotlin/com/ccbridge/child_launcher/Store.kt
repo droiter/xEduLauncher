@@ -249,9 +249,16 @@ object Store {
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
             .putExtra(LockActivity.EXTRA_REASON, reason)
         try {
+            // 「本应用自己的页面盖在桌面上了」要在 startActivity **之前**记下来：Activity 的生命周期里
+            // 桌面 MainActivity.onPause 跑在 LockActivity.onCreate 之前，等密码页自己去 onCreate 里置位
+            // 就晚了——onPause 那一刻读到的是 false，这一次离开前台会被判成「他从应用里逃回来」，
+            // 关掉密码页的瞬间白白弹一道乘法题（2026-09-20 模拟器实测，见 MainActivity.onPause）
+            LockActivity.showing = true
             ctx.startActivity(i)
             Audit.record(Audit.LOCK, reason, "拉起密码页（${if (reason == "count") "打开次数用完" else "今日时长用完"}）")
         } catch (e: Exception) {
+            // 拉不起来就别把上面那个置位留着，否则之后每次判定都当「自己的页面盖着」而全放过
+            LockActivity.showing = false
             // 无悬浮窗权限时后台启动 Activity 会被系统拦截。以前这里什么都不留，
             // 家长看到的就是「该锁屏的时候什么都没发生」——记下来才查得到
             Diag.log("gate", "拉起密码页失败（$reason）：${e.javaClass.simpleName}: ${e.message}")

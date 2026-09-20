@@ -278,8 +278,11 @@ object HttpGateway {
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
             .putExtra(HttpConsentActivity.EXTRA_IP, ip)
         try {
+            // 桌面 onPause 早于同意页 onCreate，这里先把标记立起来，见 Store.showLock 里那段说明
+            HttpConsentActivity.showing = true
             ctx.startActivity(i)
         } catch (e: Exception) {
+            HttpConsentActivity.showing = false
             // 后台启动 Activity 被系统拦了：桌面下次回前台时 onLauncherResume 会再补一次
             Diag.log("http", "拉起同意页失败：${e.javaClass.simpleName}: ${e.message}")
         }
