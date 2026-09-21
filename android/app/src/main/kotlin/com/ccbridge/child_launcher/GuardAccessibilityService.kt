@@ -117,6 +117,16 @@ class GuardAccessibilityService : AccessibilityService() {
     private var pendingTaskPkg: String? = null
     private var pendingTaskCls: String? = null
 
+    /**
+     * 上面那次「再看一眼」还允许看几次。**一次的判断不够**：孩子按下任务键那一刻，桌面还没
+     * 来得及 pause（[MainActivity.onScreen] 还是 true），2026-09-21 模拟器实测 260ms 时仍是 true，
+     * 桌面真正让位（onPause 落地）要 1.3~2 秒——只看一眼就会把**真按了任务键**也当成过渡窗口
+     * 放过，那一屏于是留在屏幕上约 2 秒（owner 说的「连按任务键还是能看到任务列表」）。
+     * 现在改成「看到桌面让位为止，最多看 [TASK_DEFER_TRIES] 眼」：过渡窗口那一路桌面始终在最前面，
+     * 几眼之后照样放过，2026-09-20 那条保护（返回键打在自己页面/挑战框上）不受影响。
+     */
+    private var deferTriesLeft = 0
+
     /** 按键过滤申请到了没有（申请不到就只能继续靠退「最近任务」那一屏兜底） */
     private var keyFilterOn = false
 
@@ -530,12 +540,13 @@ class GuardAccessibilityService : AccessibilityService() {
             if (!isRetry) {
                 pendingTaskPkg = pkg
                 pendingTaskCls = cls
+                deferTriesLeft = TASK_DEFER_TRIES
                 scheduleTaskDeferred()
             }
             Diag.log(
                 "guard",
                 "任务键：$pkg/${cls.substringAfterLast('.')} 露头，本应用桌面还站在最前面，" +
-                    "先看 ${TASK_DEFER_MS}ms 再说（过渡窗口就放过，孩子真按了就补退）",
+                    "先看 ${TASK_DEFER_MS}ms ×$TASK_DEFER_TRIES 再说（过渡窗口就放过，孩子真按了就补退）",
             )
             return
         }
@@ -634,19 +645,39 @@ class GuardAccessibilityService : AccessibilityService() {
         handler.postDelayed(taskDeferred, TASK_DEFER_MS)
     }
 
+    private fun clearPendingTask() {
+        pendingTaskPkg = null
+        pendingTaskCls = null
+        deferTriesLeft = 0
+    }
+
     private val taskDeferred = Runnable {
         val pkg = pendingTaskPkg
         val cls = pendingTaskCls
-        pendingTaskPkg = null
-        pendingTaskCls = null
         if (pkg == null || cls == null) return@Runnable
         val short = cls.substringAfterLast('.')
-        if (overlayShowing()) return@Runnable
-        if (screenJustFlipped()) return@Runnable
-        if (MainActivity.onScreen) {
-            Diag.log("guard", "任务键：$pkg/$short 露头 ${TASK_DEFER_MS}ms 后本应用桌面还在最前面，当过渡窗口放过")
+        if (overlayShowing() || screenJustFlipped()) {
+            clearPendingTask()
             return@Runnable
         }
+        if (MainActivity.onScreen) {
+            // 桌面还没让位。可能是过渡窗口（桌面始终站在最前面），也可能是孩子刚按下任务键、
+            // 桌面只是还没来得及 pause。再看几眼：真按了的话桌面几百毫秒内就会让位，
+            // 一次就下结论会把真按的那一下也放过（2026-09-21 模拟器实测：260ms 时桌面仍是 RESUMED）
+            if (deferTriesLeft > 1) {
+                deferTriesLeft--
+                scheduleTaskDeferred()
+                return@Runnable
+            }
+            clearPendingTask()
+            Diag.log(
+                "guard",
+                "任务键：$pkg/$short 露头后 ${TASK_DEFER_MS * TASK_DEFER_TRIES}ms 里本应用桌面始终在最前面，" +
+                    "当过渡窗口放过",
+            )
+            return@Runnable
+        }
+        clearPendingTask()
         if (frontPkg != pkg) {
             Diag.log(
                 "guard",
@@ -1108,10 +1139,15 @@ class GuardAccessibilityService : AccessibilityService() {
 
         /**
          * 「最近任务那一屏露头时桌面还站在最前面」那一下，隔多久回头再看一眼，见 [taskDeferred]。
-         * 太短分不出「孩子按的」和「系统过渡窗口」（桌面 pause 要一两百毫秒），
-         * 太长孩子就来得及点开列表里的卡片了
+         * **桌面让位（onPause）什么时候落地不由我们说了算**：2026-09-21 模拟器实测是 1.3~2 秒，
+         * 一眼（原来只写死 260ms 看一眼）基本必然落空，于是被当成过渡窗口放过、任务列表留在屏幕上。
+         * 所以改成密集复核：每 [TASK_DEFER_MS] 看一眼，直到桌面让位（立刻补退）或看满
+         * [TASK_DEFER_TRIES] 眼（认定是过渡窗口，放过）。间隔取短，孩子看到列表的时间就短
          */
-        private const val TASK_DEFER_MS = 260L
+        private const val TASK_DEFER_MS = 150L
+
+        /** 上面那条最多看几眼（150ms × 20 ≈ 3 秒内下结论），见 [taskDeferred] */
+        private const val TASK_DEFER_TRIES = 20
 
         /** 屏幕刚亮/刚灭之后多久内，别家桌面露头的窗口不当任务屏，见 [screenJustFlipped] */
         private const val SCREEN_FLIP_MS = 2_000L

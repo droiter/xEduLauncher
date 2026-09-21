@@ -377,6 +377,7 @@ class MainActivity : FlutterActivity() {
     override fun onPause() {
         inForeground = false
         onScreen = false
+        Diag.log("home", "onPause：桌面离开前台（onScreen=false）")
         // 屏幕已经灭着的话，这一下离开前台不是「他去了别处」——合盖时系统就是这么停掉桌面的。
         // 记下来只会在开盖那一下变成「桌面离开屏幕 X 分钟」的假证据（见 [Store.screenOffAt]）
         leftForegroundAt = if (screenIsOff()) 0L else SystemClock.elapsedRealtime()
