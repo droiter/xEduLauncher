@@ -2,8 +2,10 @@ package com.ccbridge.child_launcher
 
 import android.Manifest
 import android.app.role.RoleManager
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
 import android.graphics.Bitmap
@@ -12,6 +14,7 @@ import android.graphics.drawable.Drawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.Settings
 import androidx.core.app.ActivityCompat
@@ -75,9 +78,42 @@ class MainActivity : FlutterActivity() {
     /** 上一次「回到桌面」的判定现场，供自检报告引用 */
     private var lastHomeDecision: String? = null
 
+    /**
+     * 开关屏。注册在这里（而不是无障碍服务里）：桌面判「要不要弹挑战框」的兜底证据在
+     * 家长没开无障碍时也要管用，而且开盖那一下的现场只有 MainActivity 看得见。
+     * 屏幕熄灭/点亮都记一笔（见 [Store.screenOffAt] 那段注释），屏幕状态也顺手给守护用
+     * （开关屏瞬间系统推的窗口事件不是孩子按的任务键，见 GuardAccessibilityService）。
+     */
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context, intent: Intent) {
+            when (intent.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    Store.noteScreenOff(ctx)
+                    Diag.log("home", "屏幕熄灭：熄屏之前记下的现场不再算「他从别处回到桌面」")
+                }
+                Intent.ACTION_SCREEN_ON -> {
+                    Store.noteScreenOn(ctx)
+                    Diag.log("home", "屏幕点亮")
+                }
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Diag.attach(this)
+        try {
+            registerReceiver(
+                screenReceiver,
+                IntentFilter().apply {
+                    addAction(Intent.ACTION_SCREEN_OFF)
+                    addAction(Intent.ACTION_SCREEN_ON)
+                },
+            )
+        } catch (e: Exception) {
+            // 注册不上也照常跑：少的是「熄屏不算离开」这条保护，不该连桌面都起不来
+            Diag.log("home", "注册开关屏广播失败：${e.javaClass.simpleName}: ${e.message}")
+        }
         // Activity 被 ROM 重建、或进程被杀后按 Home 冷启动，intent 里都带着 CATEGORY_HOME。
         // 这两种都可能是「孩子本来就站在桌面上」，也可能是「他从别的应用按 Home 逃回来」，
         // 所以照常判一次（判据见 judgeAppearance），结果留给 Dart 的 config 取走。
@@ -138,13 +174,24 @@ class MainActivity : FlutterActivity() {
      */
     private fun judgeAppearance(): Pair<Boolean, String> {
         val now = SystemClock.elapsedRealtime()
-        val self = Store.selfForegroundAt(this)
-        val other = Store.otherForegroundAt(this)
+        // 熄屏期间（连同熄屏前后那一下）记下的现场一律作废：合上盖子放一会儿再打开，
+        // 中间那段时间孩子什么都没做，可 onStop/onPause 记下的「桌面离开屏幕」、以及
+        // 「别的应用露过头」看上去都像「他刚从别处回来」——2026-09-21 真机 08:11:45
+        // 就是这么白弹了一道「按返回键回到桌面」（合盖 14 分钟）。熄屏发生在哪一刻由
+        // [screenReceiver] 记，[SCREEN_OFF_GRACE_MS] 是给「离开前台」那一下留的余量：
+        // 它有时落在熄屏广播之后几毫秒（那也算熄屏造成的）
+        val screenOff = Store.screenOffAt(this).takeIf { it in 1..now } ?: 0L
+        fun live(at: Long): Long =
+            if (screenOff > 0 && at in 1..(screenOff + SCREEN_OFF_GRACE_MS)) 0L else at
+
+        val self = live(Store.selfForegroundAt(this))
+        val other = live(Store.otherForegroundAt(this))
         val front = Store.currentForeground(this) ?: "-"
         val before = GuardAccessibilityService.beforeLauncher(packageName)
         val allowedList = Store.allowed(this)
-        val leftScreen = leftScreenAt
-        val leftFg = if (leftForegroundAt == 0L) -1L else now - leftForegroundAt
+        val leftScreen = live(leftScreenAt)
+        val leftFgAt = live(leftForegroundAt)
+        val leftFg = if (leftFgAt == 0L) -1L else now - leftFgAt
         val viaHome = viaHomeIntent
 
         val verdict = when {
@@ -172,14 +219,15 @@ class MainActivity : FlutterActivity() {
                 true to "桌面这次回来前离开过屏幕（${ago(now, leftScreen)}前）"
             leftFg in FRESH_MS..EVIDENCE_MAX_MS -> true to "Activity 已离开前台 ${leftFg}ms"
             else -> false to "没拿到「从别处回来」的证据（最前=$front，桌面之前=${before ?: "（看不出）"}，" +
-                "离开前台 ${leftFg}ms）"
+                "离开前台 ${leftFg}ms）" + if (screenOff > 0) "，熄屏前后的现场已作废" else ""
         }
         Diag.log(
             "home",
             "露面判定（${if (viaHome) "按 Home 键" else "没有 Home intent（按返回键退出应用之类）"}）：" +
                 "桌面最后在前 ${ago(now, self)}前、别的应用 ${ago(now, other)}前、" +
                 "桌面之前=${before ?: "（看不出）"}、leftScreen=${ago(now, leftScreen)}前、" +
-                "leftFg=${leftFg}ms、ownPage=$coveredByOwnPage、最前=$front → " +
+                "leftFg=${leftFg}ms、ownPage=$coveredByOwnPage、最前=$front、" +
+                "熄屏=${if (screenOff == 0L) "没记过" else "${now - screenOff}ms 前"} → " +
                 "${if (verdict.first) "弹挑战" else "不打扰"}",
         )
         lastHomeDecision =
@@ -249,11 +297,18 @@ class MainActivity : FlutterActivity() {
         // 会落到桌面上，孩子并不是想回桌面——那一下返回键是本应用发的。取到了就直接把他送回
         // 刚才那个应用，不弹挑战框（家长要的是「任务键＝留在当前应用」）。
         val taskReturn = GuardAccessibilityService.consumeTaskReturn()
+        // 刚才那一下露面是本应用自己发的返回键造成的（孩子站在桌面上按任务键，或者开关屏时
+        // 系统推的那个过渡窗口）：这一下在 onStop/onPause 里留下的现场同样不是「他刚从别处回来」。
+        // 没有可送回去的应用时（站在桌面上按任务键，会话早停了）taskReturn 就是 null，
+        // 以前这种直接掉进兜底判据 → 孩子只按了任务键，却收到一道「你按了返回键」的题
+        // （2026-09-21 真机 07:39:35）
+        val ownBack = taskReturn == null && GuardAccessibilityService.taskKillRecent()
+        if (ownBack) Diag.log("home", "这一次露面是守护自己发的返回键造成的（刚退掉「最近任务」那一屏），不判、不弹框")
         // 桌面这一次露面要不要弹挑战框。判定必须赶在下面清现场之前——那时读到的才是
         // 「这一次露面之前」的状态。每一次露面只判一次：孩子按 Home 让系统把桌面重新拉起来、
         // 可桌面本来就在最前面时（没有 onPause/onResume 那一轮）根本走不到这里，
         // 系统真把它重新拉起来的那种也已经在这一次判过了，不会再翻出上一次用过的应用弹题
-        val escape = if (taskReturn != null || appearanceJudged) null else judgeAppearance()
+        val escape = if (taskReturn != null || ownBack || appearanceJudged) null else judgeAppearance()
         appearanceJudged = true
         val viaHome = viaHomeIntent
         viaHomeIntent = false
@@ -305,7 +360,9 @@ class MainActivity : FlutterActivity() {
     override fun onPause() {
         inForeground = false
         onScreen = false
-        leftForegroundAt = SystemClock.elapsedRealtime()
+        // 屏幕已经灭着的话，这一下离开前台不是「他去了别处」——合盖时系统就是这么停掉桌面的。
+        // 记下来只会在开盖那一下变成「桌面离开屏幕 X 分钟」的假证据（见 [Store.screenOffAt]）
+        leftForegroundAt = if (screenIsOff()) 0L else SystemClock.elapsedRealtime()
         // 盖上来的是本应用自己的家长页面（密码页/同意页）吗？是的话这一次离开前台不算
         // 「他离开桌面去了别处」，见 coveredByOwnPage。**不包含乘法挑战页**：那一页是从
         // 孩子正在用的应用上弹出来的，它上面的 Home 就是「从应用里逃回来」，照旧要判。
@@ -320,10 +377,15 @@ class MainActivity : FlutterActivity() {
 
     override fun onStop() {
         // 桌面被别的应用整个盖住了（不只是被弹框遮一下）。再回到桌面时，
-        // 这就是「他刚从别处回来」的硬证据；自己切回来那次会在 onResume 里作废
-        leftScreenAt = SystemClock.elapsedRealtime()
+        // 这就是「他刚从别处回来」的硬证据；自己切回来那次会在 onResume 里作废。
+        // 屏幕灭着停掉的不算（合盖、按电源键），见 [screenIsOff]
+        leftScreenAt = if (screenIsOff()) 0L else SystemClock.elapsedRealtime()
         super.onStop()
     }
+
+    /** 屏幕此刻是不是灭着（合盖/按电源键导致的离开前台都长这样） */
+    private fun screenIsOff(): Boolean =
+        !(getSystemService(Context.POWER_SERVICE) as PowerManager).isInteractive
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
@@ -382,6 +444,11 @@ class MainActivity : FlutterActivity() {
     override fun onDestroy() {
         Diag.log("act", "onDestroy")
         channel = null
+        try {
+            unregisterReceiver(screenReceiver)
+        } catch (_: IllegalArgumentException) {
+            // 没注册上（onCreate 里注册失败过）：无所谓，别在销毁路径上再抛一次
+        }
         super.onDestroy()
     }
 
@@ -942,6 +1009,13 @@ class MainActivity : FlutterActivity() {
          * 把 Activity 暂停/重建，这些变化就发生在毫秒前；只有比这更早就成立的状态才算「他本来就在桌面上」。
          */
         private const val FRESH_MS = 1200L
+
+        /**
+         * 熄屏这一下前后留的余量：熄屏广播和「Activity 离开前台」是两个系统事件，
+         * 谁先谁后不保证（真机日志里两者只差 22ms）。落在熄屏前后这个宽度里的现场都算熄屏造成的，
+         * 见 [judgeAppearance] 里的 `live()`。
+         */
+        private const val SCREEN_OFF_GRACE_MS = 3_000L
 
         /**
          * 兜底证据的有效期上限。超过这个时长的「他离开过屏幕 / 离开过前台 / 别的应用露过头」

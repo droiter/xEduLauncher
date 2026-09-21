@@ -45,6 +45,20 @@ class HttpConsentActivity : Activity() {
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() = finishWith(false)
 
+    /**
+     * [showing] 只在这一页正盖在最前面时为 true，被压到后台就置回 false——否则它一直赖着 true，
+     * 守护会以为「本应用自己的页面正开着」，从此再也不退任务屏（2026-09-21 模拟器实测）。
+     */
+    override fun onResume() {
+        super.onResume()
+        showing = true
+    }
+
+    override fun onPause() {
+        showing = false
+        super.onPause()
+    }
+
     override fun onDestroy() {
         handler.removeCallbacks(autoDeny)
         if (!answered) {

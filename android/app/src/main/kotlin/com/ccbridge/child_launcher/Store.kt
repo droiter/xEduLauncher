@@ -44,6 +44,8 @@ object Store {
     private const val K_OTHER_FG_AT = "other_foreground_at"
     private const val K_FILE_SERVER = "file_server_enabled"
     private const val K_APPROVED_IPS = "file_server_approved_ips"
+    private const val K_SCREEN_OFF_AT = "screen_off_at"
+    private const val K_SCREEN_ON_AT = "screen_on_at"
 
     /** 每个白名单应用「这一次已经用掉多少秒」，键是 session_used_<包名> */
     private const val K_SESSION_USED_PREFIX = "session_used_"
@@ -228,6 +230,8 @@ object Store {
             // 重启后 elapsedRealtime 归零，重启前记的前台时刻再也对不上谁的先谁后，清掉免得判反
             .putLong(K_SELF_FG_AT, 0L)
             .putLong(K_OTHER_FG_AT, 0L)
+            .putLong(K_SCREEN_OFF_AT, 0L)
+            .putLong(K_SCREEN_ON_AT, 0L)
             .apply()
     }
 
@@ -323,6 +327,30 @@ object Store {
 
     /** 孩子用的别的应用最后一次出现在最前面的时刻 */
     fun otherForegroundAt(ctx: Context): Long = p(ctx).getLong(K_OTHER_FG_AT, 0L)
+
+    // ---------- 屏幕熄灭 / 点亮 ----------
+
+    /**
+     * 屏幕最后一次熄灭 / 点亮的时刻（elapsedRealtime，没记过是 0）。
+     *
+     * 为什么要单独记这两个：**屏幕熄灭不等于「他从别处回到桌面」**。合上盖子放一会儿再打开，
+     * 系统不发 HOME intent，桌面 MainActivity 走一遍 onStop→onResume，而 onStop 里记下的
+     * 「桌面离开屏幕的时刻」正好落进 [MainActivity] 那条兜底判据的 1.2 秒~30 分钟区间里 →
+     * 白弹一道「按返回键回到桌面」（2026-09-21 真机日志 08:11:45：合盖 14 分钟后开盖中招；
+     * 模拟器上把屏幕关 30 秒再打开同样能复现）。有了这两个时刻，判定就能把「熄屏期间记下的
+     * 一切」当空气——那段时间孩子什么都没有做。
+     */
+    fun screenOffAt(ctx: Context): Long = p(ctx).getLong(K_SCREEN_OFF_AT, 0L)
+
+    fun screenOnAt(ctx: Context): Long = p(ctx).getLong(K_SCREEN_ON_AT, 0L)
+
+    fun noteScreenOff(ctx: Context) {
+        p(ctx).edit().putLong(K_SCREEN_OFF_AT, SystemClock.elapsedRealtime()).apply()
+    }
+
+    fun noteScreenOn(ctx: Context) {
+        p(ctx).edit().putLong(K_SCREEN_ON_AT, SystemClock.elapsedRealtime()).apply()
+    }
 
     /** 前台守护刚用 GLOBAL_ACTION_HOME 把孩子弹回桌面（防他打开非白名单应用），记下时刻 */
     fun noteGuardBounce(ctx: Context) {

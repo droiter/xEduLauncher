@@ -77,6 +77,21 @@ class SessionChallengeActivity : Activity() {
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() = Unit
 
+    /**
+     * [showing] 只在这一页正盖在最前面时为 true。被压到后面（孩子按任务键、切走、别的页面盖上
+     * 来）必须置回 false——只靠 onCreate/onDestroy 管的话，这一页被埋到后台就一直赖着 true，
+     * 守护会以为「本应用自己的页面正开着」，从此再也不退任务屏（2026-09-21 模拟器实测）。
+     */
+    override fun onResume() {
+        super.onResume()
+        showing = true
+    }
+
+    override fun onPause() {
+        showing = false
+        super.onPause()
+    }
+
     override fun onDestroy() {
         showing = false
         super.onDestroy()

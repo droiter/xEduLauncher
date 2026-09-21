@@ -78,6 +78,22 @@ class LockActivity : Activity() {
         Diag.log("gate", "密码页已显示（reason=$reason）")
     }
 
+    /**
+     * [showing] 记的是「这一页此刻盖在最前面」。被压到后面就必须置回 false——
+     * 只靠 onCreate/onDestroy 管它的话，孩子一按任务键/Home 把这一页埋到后台，它就一直
+     * 赖着 true：守护从此以为「本应用自己的页面正开着」，再也不退任务屏、也不记窗口链
+     * （2026-09-21 模拟器实测，见 GuardAccessibilityService 里那段注释）。
+     */
+    override fun onResume() {
+        super.onResume()
+        showing = true
+    }
+
+    override fun onPause() {
+        showing = false
+        super.onPause()
+    }
+
     private fun tryUnlock(reason: String, input: EditText, hint: TextView) {
         if (input.text.toString() == Store.password(this)) {
             if (reason == "count") Store.resetOpenCount(this) else Store.grantGrace(this)
