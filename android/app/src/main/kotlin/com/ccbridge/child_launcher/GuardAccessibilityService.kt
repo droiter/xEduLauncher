@@ -1,6 +1,7 @@
 package com.ccbridge.child_launcher
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
@@ -12,6 +13,7 @@ import android.os.SystemClock
 import android.provider.Settings
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
@@ -60,6 +62,17 @@ class GuardAccessibilityService : AccessibilityService() {
      */
     private var taskScreenKilledAt = 0L
 
+    /**
+     * 「最近任务」那一屏**露过头**的时刻，不管这一下退没退成、也不管最后是谁按的。
+     * 桌面判挑战框时要问这一句：那一屏只可能是任务键带出来的，孩子并没有「从应用里逃回桌面」。
+     *
+     * 和 [taskScreenKilledAt]／[lastTaskKillAt] 的区别是「有没有退成」：管控没生效、放进来的
+     * 过渡窗口、返回键被吞掉的那几下都不会留下退掉的记录，可它们照样会把 MainActivity 顶成
+     * onStop——桌面再露头时就拿到 leftScreen 这条假证据，白弹一道题
+     * （2026-09-21 模拟器实测：从任务列表按 Home 回桌面，依据 leftScreen=1398ms 弹了框）
+     */
+    private var taskScreenSeenAt = 0L
+
     /** 自检报告里那行「任务键到底拦得怎么样」的计数，见 [taskKillReport] */
     private var taskSeen = 0
     private var taskKilled = 0
@@ -67,6 +80,18 @@ class GuardAccessibilityService : AccessibilityService() {
     private var taskSkippedEcho = 0
     private var taskSkippedOff = 0
     private var taskSkippedScreen = 0
+
+    /** 「桌面还站在最前面」那一下压后再看的次数，见 [taskDeferred] */
+    private var taskDeferredSeen = 0
+
+    /** 任务键在**按键这一层**就被吃掉、任务列表根本没出现的次数，见 [onKeyEvent] */
+    private var keySwallowed = 0
+
+    /** 本应用自己的窗口露头、但桌面其实没在最前面（浮层/密码页/挑战页）而被略过的次数 */
+    private var ownWindowSkipped = 0
+
+    /** 输入法/系统界面这类「不是换应用」的窗口被挡在窗口链外面的次数，见 [noteFrontWindow] */
+    private var chainSkipped = 0
 
     /**
      * 上一次「退掉最近任务那一屏」时孩子正在用的应用，以及那一刻。桌面那边用
@@ -83,6 +108,17 @@ class GuardAccessibilityService : AccessibilityService() {
 
     /** 退掉那一屏之后还允许补退几次，见 [taskVerify] */
     private var taskRetryLeft = 0
+
+    /**
+     * 「最近任务那一屏露头了，可桌面还站在最前面」那一下压下来的现场，见 [taskDeferred]。
+     * 两种情况的现场长得一模一样（系统切桌面的过渡窗口 vs 孩子站在桌面上按了任务键），
+     * 当场分不出来，只能过一小会儿再看桌面让位了没有。
+     */
+    private var pendingTaskPkg: String? = null
+    private var pendingTaskCls: String? = null
+
+    /** 按键过滤申请到了没有（申请不到就只能继续靠退「最近任务」那一屏兜底） */
+    private var keyFilterOn = false
 
     /** 系统界面里必须放行的部分：状态栏/通知面板、权限弹框、系统本身 */
     private val exempt = setOf(
@@ -137,6 +173,7 @@ class GuardAccessibilityService : AccessibilityService() {
         Diag.attach(this)
         instance = this
         addOverlay()
+        requestKeyFilter()
         Diag.log("guard", "前台守护服务已连接（无障碍）")
         Audit.record(Audit.SERVICE, "前台守护", "无障碍服务已连接：开始拦非白名单应用、计时、看窗口链")
         // 桌面顶部那行状态要立刻从红变绿，不能等家长下一次回桌面才发现
@@ -146,6 +183,7 @@ class GuardAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         handler.removeCallbacks(sessionTick)
         handler.removeCallbacks(taskVerify)
+        handler.removeCallbacks(taskDeferred)
         sessionPkg = null
         challengeFor = null
         removeOverlay()
@@ -156,6 +194,44 @@ class GuardAccessibilityService : AccessibilityService() {
         Audit.record(Audit.SERVICE, "前台守护", "无障碍服务断开：限时/前台守护/任务键/回到桌面挑战全部失效")
         MainActivity.pushAccessibilityStatus(this)
         super.onDestroy()
+    }
+
+    /**
+     * 申请「过滤按键」。申请到之后孩子按任务键那一下会先送到 [onKeyEvent]，我们可以直接吃掉它
+     * ——**任务列表根本不会出现**，也就没有「看到的是一闪而过的列表还能点进去」这回事。
+     *
+     * 这一步是 2026-09-21 加的主防线：在这之前「按任务键」只能靠「等任务屏露头了再补发返回键」
+     * 来收拾，孩子站在桌面上按那一下尤其糟（那时桌面还没 pause，见 [killTaskScreen]）。
+     * 有的 ROM/版本不给第三方无障碍服务这个能力，申请失败或系统不认时 [onKeyEvent] 不会被调到，
+     * 那时还有 [killTaskScreen] 那条老路兜底（自检报告里两条路的计数都列出来，家长能看出在用哪条）。
+     */
+    private fun requestKeyFilter() {
+        keyFilterOn = try {
+            val info = serviceInfo ?: return
+            info.flags = info.flags or AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS
+            serviceInfo = info
+            true
+        } catch (e: Exception) {
+            Diag.log("guard", "申请「按键过滤」失败：${e.javaClass.simpleName}: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * 任务键直接在按键这一层吃掉。**管控没在生效时不吞**（家长放行期内、守护开关关着、
+     * 本应用不是默认桌面）——那几个时刻任务键本来就该照常能用。
+     *
+     * DOWN 和 UP 都要吃：只吃 DOWN 的话 UP 那一下照样会被系统当成一次完整按键。
+     */
+    override fun onKeyEvent(event: KeyEvent): Boolean {
+        if (event.keyCode != KeyEvent.KEYCODE_APP_SWITCH) return false
+        if (taskKillOffReason() != null) return false
+        if (event.action == KeyEvent.ACTION_DOWN) {
+            keySwallowed++
+            logThrottled("keySwallow", "任务键：这一下在按键这一层就被吃掉了，任务列表不会出现")
+            Audit.record(Audit.TASK_KILL, "任务键", "按下的那一刻就被吃掉（任务列表没有出现）")
+        }
+        return true
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -189,6 +265,7 @@ class GuardAccessibilityService : AccessibilityService() {
         // 自己退出去了）：把「这一屏已经退过」的记号清掉，它下次再露头才算新的一下。
         // 这一句是「连按任务键时中间那几下不能放过」的关键，见 handleTaskScreen
         val taskScreen = isTaskSwitchScreen(pkg, cls)
+        if (taskScreen) taskScreenSeenAt = SystemClock.elapsedRealtime()
         if (!taskScreen) {
             taskScreenKilledAt = 0L
             // 有别的窗口接上来了：见 taskVerify，这一刻起就不再怀疑那一屏还留在前面
@@ -299,6 +376,34 @@ class GuardAccessibilityService : AccessibilityService() {
      */
     private fun noteFrontWindow(pkg: String, cls: String) {
         if (pkg == frontPkg) return
+        // 本应用自己的窗口：只有桌面**真的在最前面**（MainActivity 是 resumed 的）才算一次
+        // 「桌面露头」。屏幕上那行小字（无障碍浮层，会话里每秒改一次文字）和密码页/挑战页/同意页
+        // 都是本应用自己的窗口，可它们盖在孩子的应用上时 MainActivity 是 paused 的——
+        // 拿它们当「桌面露头」会把「桌面之前是哪个应用」这条最结实的证据整个冲掉，
+        // 桌面就只能退到很旧的兜底证据（离开前台多久）上去判，白弹挑战框
+        // （2026-09-21 真机 14:10:19 就是这么把 frontPkg 写成本应用的）
+        if (pkg == packageName && !MainActivity.onScreen) {
+            ownWindowSkipped++
+            logThrottled(
+                "ownWindowNotFront",
+                "本应用窗口露头（${cls.substringAfterLast('.')}），但桌面没在最前面" +
+                    "（浮层/密码页/挑战页），不当成「桌面露头」",
+            )
+            return
+        }
+        // 输入法、状态栏这些不是「孩子换了个应用」，可它们会插在孩子那个应用和桌面中间。
+        // 让它们进链子的话，桌面露头时记下的「之前最前面的是谁」就成了输入法，
+        // 桌面比不中白名单，只能退到「离开屏幕多久」那条兜底证据上去判——那正是白弹挑战框的来源。
+        // 2026-09-21 真机日志里桌面露头的前一个窗口就是 com.samsung.android.honeyboard；
+        // 模拟器上同一现象复现为 com.google.android.inputmethod.latin。
+        if (pkg in inputMethodPackages() || pkg == SYSTEM_UI_PKG) {
+            chainSkipped++
+            logThrottled(
+                "chainSkipNoneApp",
+                "窗口链跳过 $pkg/${cls.substringAfterLast('.')}（输入法/系统界面，不是「孩子换应用」）",
+            )
+            return
+        }
         prevFrontPkg = frontPkg
         frontPkg = pkg
         if (pkg != packageName) return
@@ -416,10 +521,21 @@ class GuardAccessibilityService : AccessibilityService() {
             return
         }
         if (pkg != packageName && MainActivity.onScreen) {
+            // 桌面自己正站在最前面时，别的桌面冒出来的窗口**多半**是系统切桌面的过渡窗口，
+            // 这一下返回键会打在我们自己的页面上（见上面那段）。可孩子**站在桌面上**按任务键时
+            // 现场长得一模一样——按下那一刻桌面还没来得及 pause，只看这一眼根本分不出来。
+            // 所以不当场决定：压下来，[TASK_DEFER_MS] 之后再看桌面让位了没有（见 [taskDeferred]）。
+            // 2026-09-21 真机/模拟器实测：以前直接放过，孩子站在桌面上按任务键任务列表就一直留着，
+            // 点上面的卡片还能进应用（白名单应用连「准备打开」那道挑战都绕过了）
+            if (!isRetry) {
+                pendingTaskPkg = pkg
+                pendingTaskCls = cls
+                scheduleTaskDeferred()
+            }
             Diag.log(
                 "guard",
-                "任务键：$pkg/${cls.substringAfterLast('.')} 露头，但本应用桌面正站在最前面，" +
-                    "这一下不当任务键处理（多半是系统切桌面的过渡窗口）",
+                "任务键：$pkg/${cls.substringAfterLast('.')} 露头，本应用桌面还站在最前面，" +
+                    "先看 ${TASK_DEFER_MS}ms 再说（过渡窗口就放过，孩子真按了就补退）",
             )
             return
         }
@@ -499,6 +615,48 @@ class GuardAccessibilityService : AccessibilityService() {
             "任务键：${SystemClock.elapsedRealtime() - killedAt}ms 过去 $pkg/${cls.substringAfterLast('.')} " +
                 "还赖在最前面（返回键被吞了，或者孩子又按了一下），补退一次",
         )
+        killTaskScreen(pkg, cls, isRetry = true)
+    }
+
+    /**
+     * 「最近任务那一屏露头了，可本应用桌面还站在最前面」那一下，压后再看一次。
+     *
+     * 为什么非等这一会儿：孩子**站在桌面上**按任务键时，按下那一刻桌面还没 pause
+     * （[MainActivity.onScreen] 还是 true），和系统切桌面的过渡窗口在现场上完全一样。
+     * 区别要等一两百毫秒才显出来——真按了任务键，那一屏会顶上来、桌面让位；过渡窗口则一掠而过，
+     * 桌面始终在最前面。所以这里只做一件事：**桌面让位了才补退那一屏**。
+     *
+     * 补退之前还要确认「最前面还是那一屏」：孩子手脚快，可能已经点开某张卡片了，
+     * 那一下返回键就会打在他刚打开的应用上（把它按退出去），那种情况交给上面那条拦截路。
+     */
+    private fun scheduleTaskDeferred() {
+        handler.removeCallbacks(taskDeferred)
+        handler.postDelayed(taskDeferred, TASK_DEFER_MS)
+    }
+
+    private val taskDeferred = Runnable {
+        val pkg = pendingTaskPkg
+        val cls = pendingTaskCls
+        pendingTaskPkg = null
+        pendingTaskCls = null
+        if (pkg == null || cls == null) return@Runnable
+        val short = cls.substringAfterLast('.')
+        if (overlayShowing()) return@Runnable
+        if (screenJustFlipped()) return@Runnable
+        if (MainActivity.onScreen) {
+            Diag.log("guard", "任务键：$pkg/$short 露头 ${TASK_DEFER_MS}ms 后本应用桌面还在最前面，当过渡窗口放过")
+            return@Runnable
+        }
+        if (frontPkg != pkg) {
+            Diag.log(
+                "guard",
+                "任务键：$pkg/$short 露头后最前面已经换成 ${frontPkg ?: "（认不出）"}，" +
+                    "这一下不当任务键处理（多半是孩子已经点进某个应用了）",
+            )
+            return@Runnable
+        }
+        taskDeferredSeen++
+        Diag.log("guard", "任务键：$pkg/$short 露头 ${TASK_DEFER_MS}ms 后桌面已经让位，补退这一屏")
         killTaskScreen(pkg, cls, isRetry = true)
     }
 
@@ -926,6 +1084,9 @@ class GuardAccessibilityService : AccessibilityService() {
         /** 系统兜底桌面的包名（FallbackHome），见 [otherHomeApps] */
         private const val FALLBACK_HOME_PKG = "com.android.settings"
 
+        /** 系统界面（状态栏、音量条、权限弹框）。它不是「孩子换了个应用」，不进窗口链 */
+        private const val SYSTEM_UI_PKG = "com.android.systemui"
+
         /** 两次「弹回桌面」之间的最小间隔：挨着弹会闪屏 */
         private const val BOUNCE_GAP_MS = 600L
 
@@ -945,6 +1106,13 @@ class GuardAccessibilityService : AccessibilityService() {
         /** 同一屏最多补退几次，见 [taskVerify] */
         private const val TASK_RETRY_MAX = 2
 
+        /**
+         * 「最近任务那一屏露头时桌面还站在最前面」那一下，隔多久回头再看一眼，见 [taskDeferred]。
+         * 太短分不出「孩子按的」和「系统过渡窗口」（桌面 pause 要一两百毫秒），
+         * 太长孩子就来得及点开列表里的卡片了
+         */
+        private const val TASK_DEFER_MS = 260L
+
         /** 屏幕刚亮/刚灭之后多久内，别家桌面露头的窗口不当任务屏，见 [screenJustFlipped] */
         private const val SCREEN_FLIP_MS = 2_000L
 
@@ -962,6 +1130,19 @@ class GuardAccessibilityService : AccessibilityService() {
          * 太短会漏（落桌面有小延迟），太长会把他后来自己按的 Home 也吞掉
          */
         private const val TASK_RETURN_WINDOW_MS = 2_000L
+
+        /**
+         * 「最近任务」那一屏露头之后多久之内，桌面这次露面不算「从应用里逃回来」，见
+         * [taskScreenRecent]。按任务键之后落回桌面通常就在一两秒内（模拟器实测 1.4 秒），
+         * 给到 2.5 秒足够；再长就会把「按任务键进了应用、过一会儿又按 Home 出来」也一起吞掉
+         */
+        private const val TASK_SCREEN_WINDOW_MS = 2_500L
+
+        /**
+         * 判「桌面离开屏幕是不是那一屏压的」时往回放宽多少，见 [desktopLeftBecauseOfTaskScreen]。
+         * 桌面 onStop 和那一屏的窗口事件差几十到几百毫秒，不放宽会漏判
+         */
+        private const val TASK_SCREEN_SLACK_MS = 1_200L
 
         /**
          * 桌面露头多久之内还算「刚露头」。超过这个时长说明孩子已经在桌面上站着了，
@@ -1003,20 +1184,37 @@ class GuardAccessibilityService : AccessibilityService() {
 
         /**
          * 自检报告里的一行：「按任务键还能看到任务列表」到底卡在哪一步。
-         * 露头几次、退掉几次、因为什么放过几次，一眼就能对上——不用再去翻日志里那几十行 [guard]。
+         *
+         * 分两层报：**上面一条是按键这一层**（任务列表根本没出现，最理想），
+         * **下面一条是「那一屏已经露头了再退」**（按键过滤没生效时的兜底）。
+         * 两条的计数都要能对上，家长才看得出到底在用哪条路、卡在哪一步。
          */
         fun taskKillReport(): String {
             val s = instance ?: return "（无障碍服务没在运行，这些数字拿不到）\n"
+            val sb = StringBuilder()
+            sb.appendLine(
+                "按键过滤（按任务键那一下直接吃掉，任务列表根本不出现）：" +
+                    if (!s.keyFilterOn) "✗ 没申请到，只能靠下面那条路兜底"
+                    else "已申请；本次运行吃掉 ${s.keySwallowed} 次" +
+                        if (s.keySwallowed == 0) "（还没按过，或者系统没把按键送过来）" else ""
+            )
             if (s.taskSeen == 0 && s.taskSkippedOff == 0) {
-                return "（服务运行以来还没见过「最近任务」那一屏）\n"
+                sb.appendLine("「最近任务」那一屏：服务运行以来还没露过头（说明上面那条路在起作用）")
+                return sb.toString()
             }
-            return "服务运行以来：这一屏露头 ${s.taskSeen} 次、退掉 ${s.taskKilled} 次" +
-                "（其中补退 ${s.taskRetried} 次）、" +
-                "因同一屏重复事件放过 ${s.taskSkippedEcho} 次、因管控没生效放过 ${s.taskSkippedOff} 次、" +
-                "因开关屏放过 ${s.taskSkippedScreen} 次\n" +
+            sb.appendLine(
+                "服务运行以来：这一屏露头 ${s.taskSeen} 次、退掉 ${s.taskKilled} 次" +
+                    "（其中补退 ${s.taskRetried} 次、桌面还站在最前面时压后再补退 ${s.taskDeferredSeen} 次）、" +
+                    "因同一屏重复事件放过 ${s.taskSkippedEcho} 次、因管控没生效放过 ${s.taskSkippedOff} 次、" +
+                    "因开关屏放过 ${s.taskSkippedScreen} 次"
+            )
+            sb.appendLine(
                 "（「露头」应当等于「退掉」；放过的次数多，说明当时管控没生效，或者系统忙到返回键没吃上。\n" +
-                "　补退是孩子连按两下时系统不发事件、只能按时间补的那一刀，有补退不等于有问题。\n" +
-                "　开关屏那几条是系统切桌面的过渡窗口，不是孩子按的）\n"
+                    "　补退是孩子连按两下时系统不发事件、只能按时间补的那一刀，有补退不等于有问题。\n" +
+                    "　开关屏那几条是系统切桌面的过渡窗口，不是孩子按的。\n" +
+                    "　而「露头」本身就该是 0：按键被吃掉的话，这一屏压根不会出现）"
+            )
+            return sb.toString()
         }
 
         /** 桌面判「这一次露面要不要弹挑战框」的证据，见 [beforeLauncher] */
@@ -1032,6 +1230,42 @@ class GuardAccessibilityService : AccessibilityService() {
         fun taskKillRecent(maxMs: Long = TASK_RETURN_WINDOW_MS): Boolean {
             val at = instance?.lastTaskKillAt ?: 0L
             return at != 0L && SystemClock.elapsedRealtime() - at <= maxMs
+        }
+
+        /**
+         * 「最近任务」那一屏刚露过头吗（见 [taskScreenSeenAt]，不管退没退成）。
+         * 桌面判挑战框前问这一句：那一屏只可能来自任务键，这一下露面不是「从应用里逃回来」，
+         * 用 leftScreen 那类证据弹框就是白弹。
+         */
+        fun taskScreenRecent(maxMs: Long = TASK_SCREEN_WINDOW_MS): Boolean {
+            val at = instance?.taskScreenSeenAt ?: 0L
+            return at != 0L && SystemClock.elapsedRealtime() - at <= maxMs
+        }
+
+        /**
+         * 桌面这一次「离开屏幕/离开前台」是不是「最近任务」那一屏压出来的。
+         *
+         * 按任务键时那一屏盖在桌面上，桌面照样 onStop/onPause——于是 leftScreen / leftFg
+         * 这两条兜底证据看上去就像「他刚从别处回到桌面」，白弹一道题。判据是时刻对不对得上：
+         * 桌面离开的那一下落在那一屏正在屏幕上的区间里，就是它压的，不是孩子逃回来的。
+         *
+         * 2026-09-21 模拟器实测（1.0.26）：站在桌面上按任务键，任务列表停留 8 秒，
+         * 桌面露头时判定依据 leftScreen=2420ms → 弹了框；按时刻对区间就能认出来。
+         */
+        fun desktopLeftBecauseOfTaskScreen(at: Long): Boolean {
+            val s = instance ?: return false
+            if (s.taskScreenSeenAt == 0L || at == 0L) return false
+            // 只比一个方向：那一屏是在「桌面离开屏幕」之后（或紧接着之前）露的头，就是它压的。
+            // 不比另一个方向是有意的——桌面 onStop 和那一屏的窗口事件谁先谁后不一定
+            // （2026-09-21 模拟器实测两种顺序都出现过），只卡一头就不怕先后颠倒
+            return s.taskScreenSeenAt >= at - TASK_SCREEN_SLACK_MS
+        }
+
+        /** 自检报告用：那一屏最后一次露头是多久以前 */
+        fun taskScreenAgo(): String {
+            val at = instance?.taskScreenSeenAt ?: 0L
+            if (at == 0L) return "（服务运行以来还没露过头）"
+            return "${SystemClock.elapsedRealtime() - at}ms 前"
         }
 
         /**
@@ -1060,6 +1294,11 @@ class GuardAccessibilityService : AccessibilityService() {
                 "屏幕最后一次熄灭：${if (off == 0L || off > now) "（本次开机还没熄过）"
                 else "${now - off}ms 前（熄屏期间记下的现场不作数，免得合盖再开盖被当成「从别处回到桌面」）"}"
             )
+            // 这几条要是很多，说明本应用自己的浮层/页面在被当成「桌面露头」——
+            // 那会把上面那条窗口链冲掉，桌面只能退到很旧的兜底证据上去判（白弹挑战框）
+            sb.appendLine("本应用自己的窗口露头、但桌面没在最前面而略过：${s.ownWindowSkipped} 次")
+            // 这几条不该多：输入法/状态栏插进链子里，桌面就认不出「孩子之前用的是哪个应用」
+            sb.appendLine("输入法/系统界面被挡在窗口链外面：${s.chainSkipped} 次")
             return sb.toString()
         }
 

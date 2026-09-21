@@ -197,6 +197,15 @@ class MainActivity : FlutterActivity() {
         val verdict = when {
             // 守护自己刚把他弹回来的那次（孩子开了非白名单应用）不算他按的 Home，拦回桌面就完事
             Store.guardBounceRecent(this) -> false to "守护刚把他弹回桌面"
+            // 「最近任务」那一屏刚露过头（按任务键带出来的）。那一屏会把桌面顶成 onStop/onPause，
+            // 于是 leftScreen / leftFg 看上去像「他刚从别处回来」——可他只是按了任务键，什么都没逃。
+            // 这条要排在所有兜底证据前面：它证伪的正是那几条兜底证据的假设
+            GuardAccessibilityService.taskScreenRecent() -> false to "刚露头的是「最近任务」那一屏（按任务键带出来的）"
+            // 桌面这一下离开屏幕/离开前台，正是被那一屏压出来的（按时刻对区间，比上一条结实：
+            // 孩子连按任务键时那一屏能停留好几秒，光看「最近露过头」会漏）
+            GuardAccessibilityService.desktopLeftBecauseOfTaskScreen(leftScreen) ||
+                GuardAccessibilityService.desktopLeftBecauseOfTaskScreen(leftFgAt) ->
+                false to "桌面这次离开屏幕是被「最近任务」那一屏压的（按任务键带出来的）"
             // 家长刚从系统设置那趟回来（放行还没收回）：这一下是他自己按的 Home，
             // 不该让他再做一道题，否则家长外出办事回来还得答题才能用桌面
             Store.parentFreeActive(this) -> false to "家长刚在放行期里（去过系统设置之类）"
@@ -227,11 +236,19 @@ class MainActivity : FlutterActivity() {
                 "桌面最后在前 ${ago(now, self)}前、别的应用 ${ago(now, other)}前、" +
                 "桌面之前=${before ?: "（看不出）"}、leftScreen=${ago(now, leftScreen)}前、" +
                 "leftFg=${leftFg}ms、ownPage=$coveredByOwnPage、最前=$front、" +
+                "任务屏=${GuardAccessibilityService.taskScreenAgo()}、" +
                 "熄屏=${if (screenOff == 0L) "没记过" else "${now - screenOff}ms 前"} → " +
                 "${if (verdict.first) "弹挑战" else "不打扰"}",
         )
         lastHomeDecision =
             "桌面这次露面：${verdict.second} → ${if (verdict.first) "弹挑战" else "不打扰"}"
+        // 留最近几条（不只最后一条）：owner 反馈「弹了个不该弹的框」时，只看最后一条往往
+        // 已经翻篇了，看不出是刚才哪一下。带上时刻，能直接和孩子的动作对上
+        recentHomeDecisions.addLast(
+            "${clock.format(Date())} ${if (verdict.first) "弹挑战框" else "不打扰"}" +
+                "（${if (viaHome) "按 Home 键" else "没有 Home intent"}）—— ${verdict.second}"
+        )
+        while (recentHomeDecisions.size > HOME_DECISION_KEEP) recentHomeDecisions.removeFirst()
         // 判定要弹框才算「程序做了个动作」。不弹的那些不记进审计——它们本身就是「什么都没做」，
         // 记进去会把审计列表灌满，反而看不出真正的动作。依据留在运行日志的 [home] 行里
         if (verdict.first) {
@@ -942,6 +959,13 @@ class MainActivity : FlutterActivity() {
         sb.appendLine("别的应用最后一次在最前面：${agoOf(Store.otherForegroundAt(this))}")
         sb.appendLine("回到桌面挑战没过会送回的应用：${Store.lastForeign(this) ?: "（还没记录）"}")
         sb.appendLine("上一次「桌面露面」的判定：${lastHomeDecision ?: "（本次运行还没回到过桌面）"}")
+        sb.appendLine("「最近任务」那一屏最后一次露头：${GuardAccessibilityService.taskScreenAgo()}")
+        sb.appendLine("最近几次「桌面露面」判定（从旧到新，弹了不该弹的框就照着时刻对孩子的动作）：")
+        if (recentHomeDecisions.isEmpty()) {
+            sb.appendLine("  （本次运行还没有过判定）")
+        } else {
+            recentHomeDecisions.forEach { sb.appendLine("  · $it") }
+        }
         sb.appendLine(
             "桌面离开屏幕 / 离开前台的记录：leftScreen=${agoOf(leftScreenAt)}、leftFg=${agoOf(leftForegroundAt)}" +
                 "（每次判定都会消费掉，消费后显示「还没记录」是正常的）"
@@ -1056,6 +1080,13 @@ class MainActivity : FlutterActivity() {
 
         /** Activity 最后一次离开前台的时刻。进程级：Activity 被重建时，那是上一个实例留下的 */
         private var leftForegroundAt = 0L
+
+        /** 自检报告里留最近几次「桌面露面」的判定，见 [judgeAppearance] */
+        private const val HOME_DECISION_KEEP = 6
+
+        /** 上面那几行判定各自发生的时刻（时:分:秒），只用于人看，不参与任何判断 */
+        private val clock = SimpleDateFormat("HH:mm:ss", Locale.US)
+        private val recentHomeDecisions = ArrayDeque<String>()
 
         /** 桌面这次回到最前面之前真的离开过屏幕（onStop）的时刻，0 = 没有 */
         private var leftScreenAt = 0L
