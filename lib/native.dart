@@ -124,6 +124,23 @@ class Native {
   static Future<LauncherConfig> config() async =>
       LauncherConfig.fromMap(await _ch.invokeMethod('config') ?? {});
 
+  /// 拦截此刻生不生效（总闸开着，或在「测试拦截」的几分钟里）——**现问原生侧**，
+  /// 不用配置快照里那个值：快照可能是几分钟前取的，而「测试拦截」到点前后就差这一下。
+  /// 查不到时返回 false：宁可这一次不拦，也别在家长已经关掉之后还弹一道题
+  static Future<bool> interceptionOn() async {
+    try {
+      return await _ch.invokeMethod<bool>('interceptionOn') ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 开一次「测试拦截」（分钟），或者传 0 立刻关掉。返回最新配置
+  static Future<LauncherConfig> setTestGuard(int minutes) async =>
+      LauncherConfig.fromMap(
+        await _ch.invokeMethod('setTestGuard', minutes) ?? {},
+      );
+
   /// 无障碍实况。查到就顺手写进 [accessibility]，界面监听那一个就够了。
   /// 原生侧没答上来（返回 null）时**什么都不改**：一次异常查询不该把已经知道的
   /// "开着"抹掉，更不该凭空冒出一条红字警告。

@@ -15,12 +15,14 @@ Map<String, Object?> _config(
   String pkg, {
   bool coldStartHome = false,
   bool chOnHome = true,
+  List<String> hideIcon = const <String>[],
 }) => {
   'challengeType': 'mul',
   'chOnLaunch': true,
   'chOnHome': chOnHome,
   'allowed': [pkg],
   'noChallenge': const <String>[],
+  'hideIcon': hideIcon,
   'dailyLimitMin': 0,
   'isDefaultLauncher': true,
   'coldStartHome': coldStartHome,
@@ -32,6 +34,10 @@ void _mock(
   List<String>? calls,
   bool coldStartHome = false,
   bool chOnHome = true,
+  /// 家长设成「桌面不给图标」的应用
+  List<String> hideIcon = const <String>[],
+  /// 拦截总闸（含「测试拦截」）此刻生不生效，界面每次要弹挑战前都会现问一次
+  bool interceptionOn = true,
   Future<void>? configGate,
   AccessibilityStatus accessibility = const AccessibilityStatus(
     enabled: true,
@@ -44,7 +50,12 @@ void _mock(
         switch (call.method) {
           case 'config':
             if (configGate != null) await configGate;
-            return _config(pkg, coldStartHome: coldStartHome, chOnHome: chOnHome);
+            return _config(
+              pkg,
+              coldStartHome: coldStartHome,
+              chOnHome: chOnHome,
+              hideIcon: hideIcon,
+            );
           case 'listApps':
             return [
               {'package': pkg, 'label': '计算器'},
@@ -53,6 +64,8 @@ void _mock(
             return icons;
           case 'accessibilityStatus':
             return {'enabled': accessibility.enabled, 'running': accessibility.running};
+          case 'interceptionOn':
+            return interceptionOn;
           case 'returnToLastApp':
             return true;
         }
@@ -167,6 +180,17 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.textContaining('无障碍'), findsNothing);
+  });
+
+  testWidgets('家长设成「桌面不给图标」的应用，桌面上不摆它的磁贴', (tester) async {
+    final png = await _png(tester);
+    _mock('com.hidden', {'com.hidden': png}, hideIcon: ['com.hidden']);
+    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+    await tester.pumpAndSettle();
+
+    expect(find.text('计算器'), findsNothing, reason: '不给入口，磁贴就不该摆出来');
+    expect(find.text('家长设置'), findsOneWidget, reason: '两个家长入口照旧');
+    expect(find.text('系统设置'), findsOneWidget);
   });
 
   testWidgets('孩子本来就站在桌面上时，返回键不弹挑战框', (tester) async {
@@ -291,6 +315,29 @@ void main() {
     await _pressBackEscape(tester);
     expect(find.byType(Dialog), findsNothing);
     expect(calls, isNot(contains('returnToLastApp')));
+  });
+
+  testWidgets('「启动拦截」总闸关着：按 Home 回来不弹挑战框，也不送回应用', (tester) async {
+    final calls = <String>[];
+    _mock('com.guard.off', const {}, calls: calls, interceptionOn: false);
+    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+    await tester.pumpAndSettle();
+
+    await _pressHome(tester);
+    expect(find.byType(Dialog), findsNothing, reason: '整机不设防时什么都不该弹');
+    expect(calls, isNot(contains('returnToLastApp')));
+  });
+
+  testWidgets('「启动拦截」总闸关着：点白名单应用直接打开，不弹挑战', (tester) async {
+    final calls = <String>[];
+    _mock('com.launch.off', const {}, calls: calls, interceptionOn: false);
+    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('计算器'));
+    await tester.pumpAndSettle();
+    expect(find.byType(Dialog), findsNothing);
+    expect(calls, contains('launchApp'));
   });
 
   testWidgets('冷启动（进程被杀后按 Home）答错：同样送回刚才那个应用', (tester) async {

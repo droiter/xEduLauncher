@@ -35,6 +35,30 @@ void main() {
     expect(cfg.needsChallenge('com.c'), isTrue);
   });
 
+  test('白名单里可以单独指定「退回桌面时不弹挑战」的应用', () {
+    final cfg = LauncherConfig.fromMap({
+      'allowed': ['com.a', 'com.b'],
+      'freeExit': ['com.b'],
+    });
+    expect(cfg.freeExit, ['com.b']);
+    // 和「打开时不弹挑战」互不影响：com.b 点开时照样要挑战
+    expect(cfg.needsChallenge('com.b'), isTrue);
+    expect(LauncherConfig.fromMap({}).freeExit, isEmpty);
+  });
+
+  test('白名单里可以单独指定「桌面上不给图标入口」的应用', () {
+    final cfg = LauncherConfig.fromMap({
+      'allowed': ['com.a', 'com.b'],
+      'hideIcon': ['com.b'],
+    });
+    expect(cfg.hideIcon, ['com.b']);
+    expect(cfg.showsOnDesktop('com.a'), isTrue);
+    expect(cfg.showsOnDesktop('com.b'), isFalse);
+    // 不给图标 ≠ 不是白名单应用：照样打得开，点开时该挑战还是要挑战
+    expect(cfg.needsChallenge('com.b'), isTrue);
+    expect(LauncherConfig.fromMap({}).hideIcon, isEmpty);
+  });
+
   test('挑战总开关关掉时所有应用都直接打开', () {
     final cfg = LauncherConfig(chOnLaunch: false);
     expect(cfg.needsChallenge('com.a'), isFalse);

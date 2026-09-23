@@ -26,6 +26,9 @@ class GuardService : Service() {
     /** 攒够 5 秒再落盘一次，避免每秒写 SharedPreferences */
     private var pending = 0
 
+    /** 上一秒是不是因为密码页开着而没计时（只在状态翻转时记一条日志，不刷屏） */
+    private var pausedForLock = false
+
     private val tick = object : Runnable {
         override fun run() {
             step()
@@ -64,6 +67,19 @@ class GuardService : Service() {
         }
         val pm = getSystemService(POWER_SERVICE) as PowerManager
         if (!pm.isInteractive) return // 息屏不计时
+        // 密码页正盖在屏幕上时谁都用不了，这几分钟不该算进「今日已用」：它以前照算，
+        // 家长输密码那一刻已经欠着好几倍宽限，输一次根本放不出去（2026-09-22 23:17 连弹两次密码框）
+        if (LockActivity.showing) {
+            if (!pausedForLock) {
+                pausedForLock = true
+                Diag.log("gate", "密码页正开着：这几分钟不计入今日用量，用量和宽限从现在起都停在这里")
+            }
+            return
+        }
+        if (pausedForLock) {
+            pausedForLock = false
+            Diag.log("gate", "密码页关掉了：今日用量接着计")
+        }
 
         Store.rollDate(this)
         pending++

@@ -38,7 +38,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       // 界面这一侧也留一条：原生日志只能说明「Activity 起来了」，
       // 说明不了「Flutter 界面拿到了配置、磁贴画出来了」
       Native.log(
-        '桌面界面就绪：白名单 ${cfg.allowed.length} 个应用、'
+        '桌面界面就绪：白名单 ${cfg.allowed.length} 个应用'
+        '${cfg.hideIcon.isEmpty ? "" : "（其中 ${cfg.hideIcon.length} 个桌面不给图标）"}、'
         '回到桌面挑战=${cfg.chOnHome ? "开" : "关"}、'
         '单次上限=${cfg.singleUseMin <= 0 ? "不限" : "${cfg.singleUseMin} 分钟"}',
       );
@@ -96,6 +97,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       Native.log('收到「$title」通知，配置仍取不回来，只能放过这一下');
       return;
     }
+    // 「启动拦截」总闸关着（家长自己用平板，或者「测试拦截」到点了）就不弹。
+    // 原生侧判定时也会挡一道，这里再问一次是为了掐准「测试拦截」到点的那一刻：
+    // 通知发出来时还在测试里，等它到 Dart 这边可能刚好过期
+    if (!await Native.interceptionOn()) {
+      Native.log('收到「$title」通知，但「启动拦截」总闸关着（也没在测试拦截中），直接进桌面');
+      return;
+    }
     if (!cfg.chOnHome) {
       Native.log('收到「$title」通知，但「回到桌面时挑战」开关是关的，直接进桌面');
       return;
@@ -144,8 +152,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _launch(InstalledApp app) async {
     final cfg = _cfg!;
     Native.log('点了磁贴「${app.label}」（${app.package}）');
-    // 家长在「应用白名单」里把这个应用设成免挑战时，直接打开
-    if (cfg.needsChallenge(app.package) &&
+    // 家长在「应用白名单」里把这个应用设成免挑战时，直接打开；
+    // 「启动拦截」总闸关着（也没在测试）时同样一个题都不弹，点开就进
+    if (await Native.interceptionOn() &&
+        cfg.needsChallenge(app.package) &&
         !await _runChallenge('准备打开「${app.label}」')) {
       return;
     }
@@ -268,7 +278,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Widget _body(LauncherConfig cfg) {
     final byPkg = {for (final a in _installed) a.package: a};
+    // 家长把某个应用设成「桌面不给图标」时，它照样在白名单里（打得开、受管控、照计时），
+    // 这里只是不给孩子摆出那个入口
     final allowed = cfg.allowed
+        .where(cfg.showsOnDesktop)
         .map((p) => byPkg[p])
         .whereType<InstalledApp>()
         .toList();

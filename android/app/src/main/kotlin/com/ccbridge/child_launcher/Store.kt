@@ -24,7 +24,11 @@ object Store {
     private const val K_CH_ON_LAUNCH = "challenge_on_launch"
     private const val K_ALLOWED = "allowed_packages"
     private const val K_NO_CHALLENGE = "no_challenge_packages"
+    private const val K_FREE_EXIT = "free_exit_packages"
+    private const val K_HIDE_ICON = "hide_icon_packages"
     private const val K_FRONT_GUARD = "front_guard_enabled"
+    private const val K_LAUNCH_GUARD = "launch_guard_enabled"
+    private const val K_TEST_GUARD_UNTIL = "test_guard_until"
     private const val K_PARENT_FREE_UNTIL = "parent_free_until"
     private const val K_SETTINGS_FREE_MIN = "settings_free_minutes"
     private const val K_DAILY_LIMIT_MIN = "daily_limit_minutes"
@@ -63,6 +67,9 @@ object Store {
 
     /** 守护弹回桌面后，这段时间内的「回到桌面」不再算孩子按的 Home */
     private const val GUARD_BOUNCE_WINDOW_MS = 2_500L
+
+    /** 「测试拦截」开一次跑多久 */
+    const val TEST_GUARD_MIN = 3
 
     /** 默认桌面判定的缓冲窗口：这段时间内读到过 true，读不到的那一两次就按生效处理 */
     private const val DEFAULT_LAUNCHER_GRACE_MS = 30_000L
@@ -119,8 +126,56 @@ object Store {
     fun noChallenge(ctx: Context): Set<String> =
         p(ctx).getStringSet(K_NO_CHALLENGE, emptySet()) ?: emptySet()
 
+    /**
+     * 白名单里「从这个应用退回桌面时不弹挑战」的那部分应用——家长逐个应用设的。
+     * 孩子在这个应用里按 Home 键、按返回键一路退出来都直接落到桌面，当没事发生。
+     */
+    fun freeExit(ctx: Context): Set<String> =
+        p(ctx).getStringSet(K_FREE_EXIT, emptySet()) ?: emptySet()
+
+    /**
+     * 白名单里「桌面上不给图标入口」的那部分应用——家长逐个应用设的。
+     * 它们照样是白名单应用（能打开、不算非受控、单次时长照计时），只是孩子在自己的桌面上
+     * 看不到、点不着那个图标；家长要用就从系统里自己开。
+     */
+    fun hideIcon(ctx: Context): Set<String> =
+        p(ctx).getStringSet(K_HIDE_ICON, emptySet()) ?: emptySet()
+
     fun frontGuard(ctx: Context) = bool(ctx, K_FRONT_GUARD, false)
     fun settingsFreeMin(ctx: Context) = num(ctx, K_SETTINGS_FREE_MIN, 10)
+
+    // ---------- 拦截总闸 ----------
+
+    /**
+     * 「启动拦截」总闸。**缺省关着**：关着时整机不设防——非白名单应用不弹回桌面、
+     * 点开应用/从应用回桌面都不弹挑战、到达时长与次数的密码页也不拉起。
+     * 家长自己用平板时把它关掉最省事，[interceptionOn] 是所有拦截点唯一的判据。
+     */
+    fun launchGuard(ctx: Context) = bool(ctx, K_LAUNCH_GUARD, false)
+
+    /** 「测试拦截」的到期时刻（墙钟毫秒），0 = 没在测试 */
+    fun testGuardUntil(ctx: Context) = p(ctx).getLong(K_TEST_GUARD_UNTIL, 0L)
+
+    /** 测试还剩多少秒（向上取整），没在测试时是 0 */
+    fun testGuardLeftSec(ctx: Context): Int {
+        val left = testGuardUntil(ctx) - System.currentTimeMillis()
+        return if (left <= 0) 0 else ((left + 999) / 1000).toInt()
+    }
+
+    fun testGuardActive(ctx: Context) = testGuardLeftSec(ctx) > 0
+
+    /**
+     * 拦截此刻生不生效：家长把总闸打开了，**或者**正处在「测试拦截」的几分钟里。
+     * 测试是给家长验证用的——总闸关着也能临时拦一段，到点自动恢复成不设防。
+     */
+    fun interceptionOn(ctx: Context) = launchGuard(ctx) || testGuardActive(ctx)
+
+    /** 开一次「测试拦截」；minutes <= 0 表示立刻关掉 */
+    fun setTestGuard(ctx: Context, minutes: Int) {
+        val until = if (minutes <= 0) 0L
+        else System.currentTimeMillis() + minutes * 60_000L
+        p(ctx).edit().putLong(K_TEST_GUARD_UNTIL, until).apply()
+    }
 
     fun dailyLimitMin(ctx: Context) = num(ctx, K_DAILY_LIMIT_MIN, 0)
 
@@ -181,8 +236,15 @@ object Store {
      */
     fun grantGrace(ctx: Context) {
         val prefs = p(ctx)
+        // 门禁判的是 usedSeconds >= limit + extraSeconds，所以「+10 分钟」得是**从现在起**顺延 10 分钟。
+        // 只往上加 600 秒的话，超额超过一份宽限时（比如密码页摆在屏幕上那 10 分钟也被计了时）
+        // 这一次密码等于白输——门禁当场又把密码页弹回来，家长得连输两三次（2026-09-22 23:17:21 真机）。
+        // 先把此刻的超额补平，再加满一份宽限。
+        val limit = dailyLimitMin(ctx) * 60
+        val over = if (limit > 0) usedSeconds(ctx) - limit else 0
+        val base = over.coerceAtLeast(extraSeconds(ctx))
         prefs.edit()
-            .putInt(K_EXTRA_SECONDS, prefs.getInt(K_EXTRA_SECONDS, 0) + graceMin(ctx) * 60)
+            .putInt(K_EXTRA_SECONDS, base + graceMin(ctx) * 60)
             .putLong(K_LAST_RESUME, SystemClock.elapsedRealtime())
             .apply()
     }
@@ -239,6 +301,8 @@ object Store {
 
     /** 返回 "time" / "count" / null */
     fun gateReason(ctx: Context): String? {
+        // 总闸关着 = 整机不设防，使用限制也不拦（家长自己用时最省事）
+        if (!interceptionOn(ctx)) return null
         rollDate(ctx)
         val limit = dailyLimitMin(ctx) * 60
         if (limit > 0 && usedSeconds(ctx) >= limit + extraSeconds(ctx)) return "time"
@@ -249,6 +313,12 @@ object Store {
 
     fun showLock(ctx: Context, reason: String) {
         if (LockActivity.showing) return
+        // 唯一入口在这里，所以总闸也在这里把：不管谁调（守护服务、桌面 onResume、Dart 通道）
+        // 总闸关着就一个密码页都不弹
+        if (!interceptionOn(ctx)) {
+            Diag.log("gate", "命中限制 $reason，但「启动拦截」总闸关着，不弹密码页")
+            return
+        }
         val i = Intent(ctx, LockActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
             .putExtra(LockActivity.EXTRA_REASON, reason)
@@ -273,6 +343,10 @@ object Store {
     /** 单次使用时长到点：在孩子正用着的那个应用之上弹出乘法挑战页 */
     fun showSessionChallenge(ctx: Context, pkg: String) {
         if (SessionChallengeActivity.showing) return
+        if (!interceptionOn(ctx)) {
+            Diag.log("session", "$pkg 单次用满，但「启动拦截」总闸关着，不弹挑战页")
+            return
+        }
         val i = Intent(ctx, SessionChallengeActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
             .putExtra(SessionChallengeActivity.EXTRA_PKG, pkg)
@@ -504,6 +578,27 @@ object Store {
     fun hasOverlay(ctx: Context): Boolean =
         if (Build.VERSION.SDK_INT >= 23) android.provider.Settings.canDrawOverlays(ctx) else true
 
+    /**
+     * 系统现在用的是哪种导航方式：0 = 三键（返回/主页/任务）、1 = 双键、2 = 手势，-1 = 读不出来。
+     *
+     * 这一条决定「按任务键」那一下到底有没有按键事件：三键导航的任务键是把 KEYCODE_APP_SWITCH
+     * 注入进来的，无障碍的按键过滤能看见它；**手势导航（上滑并停住）压根不产生按键事件**，
+     * 那一层过滤永远等不到东西（2026-09-21 真机：1.0.27 上「按键层吃掉 0 次」而任务列表露头 20 次）。
+     * 自检报告里写出来，以后「按键过滤为什么不生效」不用再猜。
+     */
+    fun navigationMode(ctx: Context): Int = try {
+        android.provider.Settings.Secure.getInt(ctx.contentResolver, "navigation_mode", -1)
+    } catch (_: Exception) {
+        -1
+    }
+
+    fun navModeText(ctx: Context): String = when (navigationMode(ctx)) {
+        0 -> "三键导航（有任务键，按键过滤那一路可用）"
+        1 -> "双键导航"
+        2 -> "手势导航（上滑并停住，**不产生按键事件**，按键过滤那一路用不上）"
+        else -> "读不出来"
+    }
+
     /** 本应用的无障碍服务是否已在系统里被打开 */
     fun accessibilityOn(ctx: Context): Boolean = try {
         val am = ctx.getSystemService(Context.ACCESSIBILITY_SERVICE) as android.view.accessibility.AccessibilityManager
@@ -526,6 +621,8 @@ object Store {
             "chOnLaunch" to challengeOnLaunch(ctx),
             "allowed" to allowed(ctx),
             "noChallenge" to noChallenge(ctx).sorted(),
+            "freeExit" to freeExit(ctx).sorted(),
+            "hideIcon" to hideIcon(ctx).sorted(),
             "dailyLimitMin" to dailyLimitMin(ctx),
             "singleUseMin" to singleUseMin(ctx),
             "graceMin" to graceMin(ctx),
@@ -537,6 +634,8 @@ object Store {
             "hasOverlay" to hasOverlay(ctx),
             "guardEnabled" to guardEnabled(ctx),
             "frontGuard" to frontGuard(ctx),
+            "launchGuard" to launchGuard(ctx),
+            "testGuardLeftSec" to testGuardLeftSec(ctx),
             "accessibilityOn" to accessibilityOn(ctx),
             "settingsFreeMin" to settingsFreeMin(ctx),
             "fileServerOn" to fileServerOn(ctx),
@@ -564,6 +663,22 @@ object Store {
                 if (keep == null) it.toSet() else it.filter { p -> p in keep }.toSet(),
             )
         }
+        (m["freeExit"] as? List<String>)?.let {
+            // 同上：只保留还在白名单里的包
+            val keep = (m["allowed"] as? List<String>)?.toSet()
+            e.putStringSet(
+                K_FREE_EXIT,
+                if (keep == null) it.toSet() else it.filter { p -> p in keep }.toSet(),
+            )
+        }
+        (m["hideIcon"] as? List<String>)?.let {
+            // 同上：只保留还在白名单里的包
+            val keep = (m["allowed"] as? List<String>)?.toSet()
+            e.putStringSet(
+                K_HIDE_ICON,
+                if (keep == null) it.toSet() else it.filter { p -> p in keep }.toSet(),
+            )
+        }
         (m["dailyLimitMin"] as? Number)?.let { e.putInt(K_DAILY_LIMIT_MIN, it.toInt()) }
         (m["singleUseMin"] as? Number)?.let {
             val v = it.toInt().coerceIn(0, 120)
@@ -576,6 +691,7 @@ object Store {
         (m["openLimit"] as? Number)?.let { e.putInt(K_OPEN_LIMIT, it.toInt()) }
         (m["guardEnabled"] as? Boolean)?.let { e.putBoolean(K_GUARD_ENABLED, it) }
         (m["frontGuard"] as? Boolean)?.let { e.putBoolean(K_FRONT_GUARD, it) }
+        (m["launchGuard"] as? Boolean)?.let { e.putBoolean(K_LAUNCH_GUARD, it) }
         (m["settingsFreeMin"] as? Number)?.let { e.putInt(K_SETTINGS_FREE_MIN, it.toInt()) }
         (m["fileServerOn"] as? Boolean)?.let { e.putBoolean(K_FILE_SERVER, it) }
         e.apply()

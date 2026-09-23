@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -17,6 +19,10 @@ class _SettingsScreenState extends State<SettingsScreen>
   LauncherConfig? _cfg;
   String _defaultLauncher = '';
 
+  /// 「测试拦截」还剩多少秒。真相在原生侧（按到期时刻算），这里只是为了让它每秒往下走
+  int _testLeft = 0;
+  Timer? _testTimer;
+
   @override
   void initState() {
     super.initState();
@@ -27,6 +33,7 @@ class _SettingsScreenState extends State<SettingsScreen>
 
   @override
   void dispose() {
+    _testTimer?.cancel();
     Native.homeResult.removeListener(_onHomeResult);
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
@@ -53,8 +60,30 @@ class _SettingsScreenState extends State<SettingsScreen>
     setState(() {
       _cfg = cfg;
       _defaultLauncher = name;
+      _testLeft = cfg.testGuardLeftSec;
+    });
+    _syncTestTimer();
+  }
+
+  /// 测试拦截的倒计时。它只是把原生侧那个到期时刻显示出来——到 0 就再读一次配置，
+  /// 让开关自己弹回去（真正的判定一直在原生侧，页面关掉也照样到点失效）
+  void _syncTestTimer() {
+    _testTimer?.cancel();
+    _testTimer = null;
+    if (_testLeft <= 0) return;
+    _testTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      setState(() => _testLeft = _testLeft > 0 ? _testLeft - 1 : 0);
+      if (_testLeft > 0) return;
+      _testTimer?.cancel();
+      _testTimer = null;
+      _toast('测试拦截已结束（3 分钟到）');
+      _load();
     });
   }
+
+  String get _testLeftText =>
+      '${_testLeft ~/ 60}:${(_testLeft % 60).toString().padLeft(2, '0')}';
 
   Future<void> _patch(Map<String, dynamic> m) async {
     final cfg = await Native.updateConfig(m);
@@ -189,6 +218,44 @@ class _SettingsScreenState extends State<SettingsScreen>
           : ListView(
               padding: const EdgeInsets.only(bottom: 32),
               children: [
+                _section('拦截'),
+                SwitchListTile(
+                  title: const Text('启动拦截（总闸）'),
+                  subtitle: Text(
+                    !cfg.launchGuard
+                        ? '关着 = 整机不设防：非白名单应用不弹回桌面，点开应用、从应用回桌面都不答题，'
+                              '用满了时长/次数也不弹密码页。家长自己用平板时保持关着最省事。\n'
+                              '打开后，下面「挑战设置」「防绕过」「使用限制」里配的东西才开始生效。\n'
+                              '缺省是关的。'
+                        : '已打开：下面各项按自己的开关生效'
+                              '${cfg.frontGuard ? '' : '（要拦非白名单应用，还得把下面「前台守护」也打开）'}。',
+                  ),
+                  value: cfg.launchGuard,
+                  onChanged: _toggleLaunchGuard,
+                ),
+                SwitchListTile(
+                  title: const Text('测试拦截（3 分钟）'),
+                  secondary: _testLeft > 0
+                      ? Text(
+                          _testLeftText,
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontFeatures: [FontFeature.tabularFigures()],
+                          ),
+                        )
+                      : null,
+                  subtitle: Text(
+                    _testLeft > 0
+                        ? '测试中，还剩 $_testLeftText：这段时间里按「启动拦截」已打开来拦，'
+                              '3 分钟一到自动关掉，也可以现在手动关。'
+                              '${cfg.launchGuard ? '' : '\n注意：总闸本身还关着，测试一结束就回到不设防。'}'
+                        : '打开后先拦 3 分钟，用来验证「到底拦不拦得住」，到时自动关掉，'
+                              '不用改「启动拦截」的总闸。',
+                  ),
+                  value: _testLeft > 0,
+                  onChanged: _toggleTestGuard,
+                ),
+
                 _section('挑战设置'),
                 ListTile(
                   title: const Text('挑战类型'),
@@ -203,7 +270,8 @@ class _SettingsScreenState extends State<SettingsScreen>
                     '孩子本来就站在桌面上时不打扰。\n'
                     '答对才留在桌面；答错（或密码题里取消）就把他送回刚才那个应用。\n'
                     '算术题只有一次机会，答错直接送走，不给第二次。\n'
-                    '按返回键这一路要靠「前台守护」的无障碍权限才看得见',
+                    '按返回键这一路要靠「前台守护」的无障碍权限才看得见。\n'
+                    '单个应用可以例外：在白名单里把那个应用的「退出」开关关掉，他就能随时退回桌面',
                   ),
                   value: cfg.chOnHome,
                   onChanged: (v) => _patch({'chOnHome': v}),
@@ -280,7 +348,9 @@ class _SettingsScreenState extends State<SettingsScreen>
                     cfg.allowed.isEmpty
                         ? '尚未添加，孩子只能看到「家长设置」'
                         : '已允许 ${cfg.allowed.length} 个应用'
-                              '${cfg.noChallenge.isEmpty ? '' : '，其中 ${cfg.noChallenge.length} 个打开时不弹挑战'}',
+                              '${cfg.noChallenge.isEmpty ? '' : '，其中 ${cfg.noChallenge.length} 个打开时不弹挑战'}'
+                              '${cfg.freeExit.isEmpty ? '' : '，${cfg.freeExit.length} 个可随意退到桌面'}'
+                              '${cfg.hideIcon.isEmpty ? '' : '，${cfg.hideIcon.length} 个桌面上不给图标'}',
                   ),
                   trailing: const Icon(Icons.chevron_right),
                   onTap: _pickApps,
@@ -291,9 +361,13 @@ class _SettingsScreenState extends State<SettingsScreen>
                   title: const Text('前台守护（防任务键切换）'),
                   subtitle: Text(
                     !cfg.frontGuard
-                        ? '打开后，非白名单应用一露头就被送回桌面；孩子按任务键也切不出去，留在当前应用'
+                        ? '打开后，非白名单应用一露头就被送回桌面；孩子按任务键时，站在桌面上就把桌面叫回最前面，'
+                            '在应用里就退掉那一屏、人还留在应用里'
+                        : !cfg.interceptionOn
+                        ? '开关已打开，但上面「启动拦截」总闸关着（也没在测试拦截中），等于没拦'
                         : cfg.accessibilityOn
-                        ? '已生效：非白名单应用一露头就送回桌面；按任务键会被拒绝，孩子留在当前应用'
+                        ? '已生效：非白名单应用一露头就送回桌面；按任务键切不出去——在桌面上按桌面立刻回来，'
+                            '在应用里按就留在应用里'
                         : '开关已打开，但系统「无障碍」里还没启用，去下面那一项打开',
                   ),
                   value: cfg.frontGuard,
@@ -544,12 +618,52 @@ class _SettingsScreenState extends State<SettingsScreen>
         builder: (_) => AppPickerScreen(
           selected: cfg.allowed,
           noChallenge: cfg.noChallenge,
+          freeExit: cfg.freeExit,
+          hideIcon: cfg.hideIcon,
         ),
       ),
     );
     if (res == null) return;
-    // 两个字段一起提交：原生侧要靠 allowed 清掉已经被移除应用的免挑战配置
-    await _patch({'allowed': res.allowed, 'noChallenge': res.noChallenge});
+    // 四个字段一起提交：原生侧要靠 allowed 清掉已经被移除应用的免挑战/随意退出/不给图标配置
+    await _patch({
+      'allowed': res.allowed,
+      'noChallenge': res.noChallenge,
+      'freeExit': res.freeExit,
+      'hideIcon': res.hideIcon,
+    });
+  }
+
+  Future<void> _toggleLaunchGuard(bool v) async {
+    await _patch({'launchGuard': v});
+    if (!v || !mounted) return;
+    final cfg = _cfg;
+    if (cfg == null) return;
+    // 总闸打开、下面每一项却都还关着 —— 家长看到的会是「打开了但什么都没拦」，
+    // 直接说清楚，省得当成 bug 排查
+    if (!cfg.frontGuard &&
+        !cfg.chOnLaunch &&
+        !cfg.chOnHome &&
+        !cfg.timeLimitOn &&
+        !cfg.openLimitOn &&
+        cfg.singleUseMin <= 0) {
+      _toast('总闸打开了，但下面每一项都还关着，等于没拦：去「防绕过」打开「前台守护」，'
+          '或到「挑战设置」里打开挑战');
+    }
+  }
+
+  Future<void> _toggleTestGuard(bool v) async {
+    final cfg = await Native.setTestGuard(v ? 3 : 0);
+    if (!mounted) return;
+    setState(() {
+      _cfg = cfg;
+      _testLeft = cfg.testGuardLeftSec;
+    });
+    _syncTestTimer();
+    _toast(
+      v
+          ? '开始测试拦截：3 分钟内按「启动拦截」已打开来拦，到时自动关掉'
+          : '已关掉测试拦截',
+    );
   }
 
   Future<void> _toggleFrontGuard(bool v) async {
@@ -569,8 +683,8 @@ class _SettingsScreenState extends State<SettingsScreen>
         content: const Text(
           '安卓上只有「无障碍」能让应用实时知道当前前台是哪个应用。\n\n'
           '打开后：非白名单应用一露头（比如从通知点开、或从最近任务切回一个后台还在跑的'
-          '系统设置）就会被立刻送回儿童桌面；孩子按任务键（最近任务）也切不出去，'
-          '仍然留在当前应用里。\n\n'
+          '系统设置）就会被立刻送回儿童桌面；孩子按任务键（最近任务）也切不出去——'
+          '站在桌面上按，儿童桌面立刻回到最前面；在白名单应用里按，人就留在那个应用里。\n\n'
           '接下来会跳到系统页面，请在列表里找到「儿童桌面」并打开它。\n'
           '本应用只用它做这一件事，不读取屏幕内容、不联网。',
         ),

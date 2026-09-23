@@ -7,7 +7,11 @@ import 'package:child_launcher/settings_screen.dart';
 
 const _channel = MethodChannel('child_launcher/native');
 
-Map<String, Object?> _config({List<String> noChallenge = const []}) => {
+Map<String, Object?> _config({
+  List<String> noChallenge = const [],
+  List<String> freeExit = const [],
+  List<String> hideIcon = const [],
+}) => {
   'password': '123456',
   'settingsPassword': '123456',
   'settingsPwCustom': false,
@@ -17,6 +21,8 @@ Map<String, Object?> _config({List<String> noChallenge = const []}) => {
   'chOnBack': true,
   'allowed': ['com.a', 'com.b'],
   'noChallenge': noChallenge,
+  'freeExit': freeExit,
+  'hideIcon': hideIcon,
   'dailyLimitMin': 30,
   'singleUseMin': 5,
   'graceMin': 10,
@@ -28,6 +34,8 @@ Map<String, Object?> _config({List<String> noChallenge = const []}) => {
   'hasOverlay': true,
   'guardEnabled': false,
   'frontGuard': false,
+  'launchGuard': false,
+  'testGuardLeftSec': 0,
   'accessibilityOn': false,
   'settingsFreeMin': 10,
   'fileServerOn': false,
@@ -52,6 +60,8 @@ void _mock(Map<String, Object?> Function() config) {
             return config();
           case 'setFileServer':
             return config();
+          case 'setTestGuard':
+            return config();
         }
         return null;
       });
@@ -60,7 +70,7 @@ void _mock(Map<String, Object?> Function() config) {
 void main() {
   /// 把测试画布放高，整页设置一次全部渲染出来，免得靠滚动去够下面的条目
   void useTallScreen(WidgetTester tester) {
-    tester.view.physicalSize = const Size(1200, 4600);
+    tester.view.physicalSize = const Size(1200, 5600);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
   }
@@ -78,6 +88,55 @@ void main() {
     expect(find.text('修改家长控制密码'), findsOneWidget);
     expect(find.text('修改系统设置密码'), findsOneWidget);
     expect(find.textContaining('未单独设置，目前沿用家长控制密码'), findsOneWidget);
+  });
+
+  testWidgets('拦截总闸缺省关着，说明里写清「关掉就整机不设防」', (tester) async {
+    _mock(_config);
+    useTallScreen(tester);
+    await tester.pumpWidget(const MaterialApp(home: SettingsScreen()));
+    await tester.pumpAndSettle();
+
+    expect(find.text('启动拦截（总闸）'), findsOneWidget);
+    expect(find.text('测试拦截（3 分钟）'), findsOneWidget);
+    expect(find.textContaining('整机不设防'), findsWidgets);
+    expect(find.textContaining('缺省是关的'), findsOneWidget);
+  });
+
+  testWidgets('前台守护开着但总闸关着时，说明里点出「等于没拦」', (tester) async {
+    _mock(() => {..._config(), 'frontGuard': true});
+    useTallScreen(tester);
+    await tester.pumpWidget(const MaterialApp(home: SettingsScreen()));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('等于没拦'), findsOneWidget);
+  });
+
+  testWidgets('开「测试拦截」后倒计时往下走，到点自己关掉', (tester) async {
+    var left = 0;
+    _mock(() => {..._config(), 'testGuardLeftSec': left});
+    useTallScreen(tester);
+    await tester.pumpWidget(const MaterialApp(home: SettingsScreen()));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('测试中'), findsNothing);
+
+    left = 3; // 原生侧返回「还剩 3 秒」，省得在测试里等三分钟
+    await tester.tap(find.widgetWithText(SwitchListTile, '测试拦截（3 分钟）'));
+    await tester.pump();
+    await tester.pump();
+    expect(find.textContaining('还剩 0:03'), findsOneWidget);
+
+    await tester.pump(const Duration(seconds: 1));
+    expect(find.textContaining('还剩 0:02'), findsOneWidget);
+    await tester.pump(const Duration(seconds: 1));
+    expect(find.textContaining('还剩 0:01'), findsOneWidget);
+
+    // 到点：再读一次配置（原生侧此刻已经返回 0），开关自己弹回去
+    left = 0;
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pump();
+    await tester.pump();
+    expect(find.textContaining('测试中，还剩'), findsNothing);
+    expect(find.textContaining('到时自动关掉，不用改'), findsOneWidget);
   });
 
   testWidgets('单次使用时长上限：可调，且说明里写明「离开只是暂停、剩余留着」', (tester) async {
@@ -145,7 +204,7 @@ void main() {
     expect(find.textContaining('孩子拿不到这个密码'), findsOneWidget);
   });
 
-  testWidgets('白名单里已勾选的应用可以单独设为「不弹挑战」', (tester) async {
+  testWidgets('白名单里已勾选的应用可以逐个设「不弹挑战」/「可随意退到桌面」/「桌面不给图标」', (tester) async {
     _mock(_config);
     AppPickerResult? result;
     await tester.pumpWidget(MaterialApp(
@@ -157,6 +216,8 @@ void main() {
                 builder: (_) => const AppPickerScreen(
                   selected: ['com.b'],
                   noChallenge: [],
+                  freeExit: [],
+                  hideIcon: [],
                 ),
               ),
             );
@@ -168,17 +229,76 @@ void main() {
     await tester.tap(find.text('打开'));
     await tester.pumpAndSettle();
 
-    // 勾选项默认「打开时需要挑战」，此时不弹挑战名单为空
-    expect(find.text('打开时需要挑战'), findsOneWidget);
-    expect(find.textContaining('已选 1 个应用，其中 0 个打开时不弹挑战'), findsOneWidget);
+    // 默认三个开关都是开的（打开要挑战、退回桌面要挑战、桌面显示图标），三份例外名单都是空的
+    expect(find.text('打开要挑战 · 退回桌面要挑战 · 桌面显示图标'), findsOneWidget);
+    expect(
+      find.textContaining('已选 1 个应用：0 个打开免挑战、0 个可随意退到桌面、0 个不在桌面显示'),
+      findsOneWidget,
+    );
 
+    // 第一个开关管「进入」，第二个管「退出」，第三个管「显示」
     await tester.tap(find.byType(Switch).first);
     await tester.pumpAndSettle();
-    expect(find.text('打开时不需要挑战，直接进入'), findsOneWidget);
+    expect(find.text('打开免挑战 · 退回桌面要挑战 · 桌面显示图标'), findsOneWidget);
+
+    await tester.tap(find.byType(Switch).at(1));
+    await tester.pumpAndSettle();
+    expect(find.text('打开免挑战 · 可随意退到桌面 · 桌面显示图标'), findsOneWidget);
+    expect(
+      find.textContaining('已选 1 个应用：1 个打开免挑战、1 个可随意退到桌面、0 个不在桌面显示'),
+      findsOneWidget,
+    );
+
+    // 关掉「显示」＝ 这个应用不进孩子的桌面，但仍是白名单应用
+    await tester.tap(find.byType(Switch).at(2));
+    await tester.pumpAndSettle();
+    expect(find.text('打开免挑战 · 可随意退到桌面 · 桌面不显示'), findsOneWidget);
+    expect(
+      find.textContaining('已选 1 个应用：1 个打开免挑战、1 个可随意退到桌面、1 个不在桌面显示'),
+      findsOneWidget,
+    );
 
     await tester.tap(find.text('保存'));
     await tester.pumpAndSettle();
     expect(result!.allowed, ['com.b']);
     expect(result!.noChallenge, ['com.b']);
+    expect(result!.freeExit, ['com.b']);
+    expect(result!.hideIcon, ['com.b']);
+  });
+
+  testWidgets('取消勾选时「可随意退到桌面」「桌面不给图标」的配置跟着一起清掉', (tester) async {
+    _mock(_config);
+    AppPickerResult? result;
+    await tester.pumpWidget(MaterialApp(
+      home: Builder(
+        builder: (ctx) => ElevatedButton(
+          onPressed: () async {
+            result = await Navigator.of(ctx).push<AppPickerResult>(
+              MaterialPageRoute(
+                builder: (_) => const AppPickerScreen(
+                  selected: ['com.b'],
+                  noChallenge: ['com.b'],
+                  freeExit: ['com.b'],
+                  hideIcon: ['com.b'],
+                ),
+              ),
+            );
+          },
+          child: const Text('打开'),
+        ),
+      ),
+    ));
+    await tester.tap(find.text('打开'));
+    await tester.pumpAndSettle();
+
+    // 点整行 = 取消勾选这个应用
+    await tester.tap(find.text('数学练习'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('保存'));
+    await tester.pumpAndSettle();
+    expect(result!.allowed, isEmpty);
+    expect(result!.noChallenge, isEmpty);
+    expect(result!.freeExit, isEmpty);
+    expect(result!.hideIcon, isEmpty);
   });
 }

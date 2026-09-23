@@ -14,6 +14,14 @@ class LauncherConfig {
 
   /// [allowed] 里「点开直接进、不弹挑战」的那部分
   List<String> noChallenge;
+
+  /// [allowed] 里「从这个应用退回桌面时不弹挑战」的那部分：孩子在里面按 Home / 返回键
+  /// 退出来就直接落到桌面，不用答题
+  List<String> freeExit;
+
+  /// [allowed] 里「桌面上不给图标入口」的那部分：照样是白名单应用（能进、算受控、照计时），
+  /// 只是孩子的桌面上看不到、点不着它的图标
+  List<String> hideIcon;
   int dailyLimitMin;
 
   /// 单次使用时长上限（分钟，0 = 不限）：孩子在同一个白名单应用里用满这么久就弹乘法题。
@@ -30,6 +38,12 @@ class LauncherConfig {
 
   /// 前台守护：非白名单应用一进前台就送回桌面（需无障碍权限）
   bool frontGuard;
+
+  /// 「启动拦截」总闸。**缺省关着**：关着时整机不设防——不弹回桌面、不弹挑战、不弹密码页
+  bool launchGuard;
+
+  /// 「测试拦截」还剩多少秒（0 = 没在测试）。测试期间按总闸已打开来拦，到时自动关
+  int testGuardLeftSec;
 
   /// 无障碍服务当前是否已在系统里启用
   bool accessibilityOn;
@@ -55,6 +69,8 @@ class LauncherConfig {
     this.chOnLaunch = true,
     this.allowed = const [],
     this.noChallenge = const [],
+    this.freeExit = const [],
+    this.hideIcon = const [],
     this.dailyLimitMin = 0,
     this.singleUseMin = 10,
     this.graceMin = 10,
@@ -66,6 +82,8 @@ class LauncherConfig {
     this.hasOverlay = false,
     this.guardEnabled = false,
     this.frontGuard = false,
+    this.launchGuard = false,
+    this.testGuardLeftSec = 0,
     this.accessibilityOn = false,
     this.settingsFreeMin = 10,
     this.fileServerOn = false,
@@ -82,6 +100,8 @@ class LauncherConfig {
     chOnLaunch: m['chOnLaunch'] as bool? ?? true,
     allowed: (m['allowed'] as List?)?.cast<String>() ?? const [],
     noChallenge: (m['noChallenge'] as List?)?.cast<String>() ?? const [],
+    freeExit: (m['freeExit'] as List?)?.cast<String>() ?? const [],
+    hideIcon: (m['hideIcon'] as List?)?.cast<String>() ?? const [],
     dailyLimitMin: (m['dailyLimitMin'] as num?)?.toInt() ?? 0,
     singleUseMin: (m['singleUseMin'] as num?)?.toInt() ?? 10,
     graceMin: (m['graceMin'] as num?)?.toInt() ?? 10,
@@ -93,6 +113,8 @@ class LauncherConfig {
     hasOverlay: m['hasOverlay'] as bool? ?? false,
     guardEnabled: m['guardEnabled'] as bool? ?? false,
     frontGuard: m['frontGuard'] as bool? ?? false,
+    launchGuard: m['launchGuard'] as bool? ?? false,
+    testGuardLeftSec: (m['testGuardLeftSec'] as num?)?.toInt() ?? 0,
     accessibilityOn: m['accessibilityOn'] as bool? ?? false,
     settingsFreeMin: (m['settingsFreeMin'] as num?)?.toInt() ?? 10,
     fileServerOn: m['fileServerOn'] as bool? ?? false,
@@ -104,6 +126,9 @@ class LauncherConfig {
   bool needsChallenge(String package) =>
       chOnLaunch && !noChallenge.contains(package);
 
+  /// 这个应用的图标要不要出现在孩子的桌面上
+  bool showsOnDesktop(String package) => !hideIcon.contains(package);
+
   /// 当日剩余可用秒数；未设置上限时返回 null
   int? get remainingSeconds {
     if (dailyLimitMin <= 0) return null;
@@ -114,6 +139,10 @@ class LauncherConfig {
 
   bool get timeLimitOn => dailyLimitMin > 0;
   bool get openLimitOn => openLimit > 0;
+
+  /// 拦截此刻生不生效（总闸开着，或在「测试拦截」的几分钟里）。
+  /// 注意这只是配置快照：到点那一刻前后要拿准，用 Native.interceptionOn() 现问原生侧
+  bool get interceptionOn => launchGuard || testGuardLeftSec > 0;
 
   String get challengeLabel => switch (challengeType) {
     'none' => '不需要挑战',

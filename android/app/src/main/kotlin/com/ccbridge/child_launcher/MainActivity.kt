@@ -189,12 +189,18 @@ class MainActivity : FlutterActivity() {
         val front = Store.currentForeground(this) ?: "-"
         val before = GuardAccessibilityService.beforeLauncher(packageName)
         val allowedList = Store.allowed(this)
+        val freeExitList = Store.freeExit(this)
+        val lastForeign = Store.lastForeign(this) ?: ""
         val leftScreen = live(leftScreenAt)
         val leftFgAt = live(leftForegroundAt)
         val leftFg = if (leftFgAt == 0L) -1L else now - leftFgAt
         val viaHome = viaHomeIntent
 
         val verdict = when {
+            // 总闸关着（家长自己用平板，或者「测试拦截」到点了）：从应用回桌面不弹挑战，
+            // 孩子按 Home / 按返回键退出应用都直接进桌面。这一条排在最前面——
+            // 它是「拦截此刻生不生效」的总判据，其它证据再结实也轮不上
+            !Store.interceptionOn(this) -> false to "「启动拦截」总闸关着（也没在测试拦截中），不拦"
             // 守护自己刚把他弹回来的那次（孩子开了非白名单应用）不算他按的 Home，拦回桌面就完事
             Store.guardBounceRecent(this) -> false to "守护刚把他弹回桌面"
             // 「最近任务」那一屏刚露过头（按任务键带出来的）。那一屏会把桌面顶成 onStop/onPause，
@@ -216,8 +222,18 @@ class MainActivity : FlutterActivity() {
             // 「」= 无障碍看见桌面之前是本应用自己的页面（密码页/乘法挑战页/同意页盖在上面），
             // 那不是从应用里逃出来的——这条要排在兜底证据前面，否则锁屏页一关就误判成逃回桌面
             before != null && before.isEmpty() -> false to "刚才盖在上面的是本应用自己的页面"
+            // 家长在这个应用上勾了「退回桌面时不弹挑战」：他从这个应用里按 Home / 按返回键
+            // 退出来就是可以直接到桌面。这条要排在下面那条通用判据前面——两条都是 from 白名单，
+            // 差别只在家长逐个应用设的那个开关
+            before != null && before in freeExitList ->
+                false to "$before 被设成「退回桌面时不弹挑战」，他可以直接退出来"
             before != null && before in allowedList ->
                 true to "无障碍看见桌面之前是 $before（孩子白名单里的应用）"
+            // 无障碍那条证据没拿到（窗口链太旧之类）时，兜底这一路只知道「别的应用刚露过头」，
+            // 不知道是谁。lastForeign 和 other 那个时刻是同一批窗口事件里记的，指向同一个包，
+            // 正好补上这个包名——家长设了「退回桌面不弹挑战」的那个应用就同样放行
+            lastForeign in freeExitList && other > self && now - other <= EVIDENCE_MAX_MS ->
+                false to "$lastForeign 被设成「退回桌面时不弹挑战」，他可以直接退出来（兜底证据）"
             // 兜底证据既要「放了一会儿」（FRESH_MS：这一下露面自己造成的现场变化不算数），
             // 也要「没放太久」（EVIDENCE_MAX_MS）。以前只卡了下限，于是 2026-09-16 的真机日志里
             // 出现过：孩子熬夜放了一夜、屏幕一亮桌面回到最前，系统拿 **6.8 小时前**「别的应用
@@ -524,6 +540,24 @@ class MainActivity : FlutterActivity() {
             "launcherDiagClear" -> result.success(Diag.clearAll(this))
             // 桌面顶部那行实时状态用。界面上「无障碍还开着吗」这件事，以前只有自检报告里能查到
             "accessibilityStatus" -> result.success(accessibilityStatusMap(this))
+            // 拦截此刻生不生效（总闸开着，或在「测试拦截」的几分钟里）。
+            // Dart 侧每次要弹挑战之前现问一次，不拿配置快照里那个会过期的值判——
+            // 「测试拦截」到点的前前后后就差这几百毫秒
+            "interceptionOn" -> result.success(Store.interceptionOn(this))
+            // 开/关一次「测试拦截」（参数是分钟，<=0 就是关掉），回来时顺便把最新配置带上
+            "setTestGuard" -> {
+                val before = Store.configMap(this)
+                val min = (args as? Number)?.toInt() ?: 0
+                Store.setTestGuard(this, min)
+                val after = Store.configMap(this)
+                result.success(after)
+                logConfigChange(before, after)
+                Diag.log(
+                    "guard",
+                    if (min > 0) "家长开了「测试拦截」：$min 分钟内按总闸已打开来拦"
+                    else "家长关掉了「测试拦截」",
+                )
+            }
             "openSystemSettings" -> {
                 leaveLauncherFor(
                     Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
@@ -937,6 +971,18 @@ class MainActivity : FlutterActivity() {
         }
         sb.appendLine("上次「默认桌面」尝试：${lastHomeOutcome ?: "（本次运行还没点过）"}")
         sb.appendLine()
+        sb.appendLine("── 拦截总闸 ──")
+        val left = Store.testGuardLeftSec(this)
+        sb.appendLine(
+            "「启动拦截」总闸：" + if (Store.launchGuard(this)) "已打开" else "关着（缺省就是关的）"
+        )
+        sb.appendLine(
+            "「测试拦截」：" + if (left > 0) "进行中，还剩 ${left}s（到时自动关）" else "没在测试"
+        )
+        sb.appendLine(
+            "⇒ 拦截此刻" + if (Store.interceptionOn(this)) "生 效" else "不生效：整机不设防（不弹回桌面、不弹挑战、不弹密码页）"
+        )
+        sb.appendLine()
         sb.appendLine("── 前台守护（拦非白名单应用 + 拒绝任务键）──")
         sb.appendLine("管控此刻在生效吗：${GuardAccessibilityService.guardStateText(this)}")
         sb.appendLine("「按任务键退掉最近任务」那一屏：${GuardAccessibilityService.taskKillStateText(this)}")
@@ -944,8 +990,12 @@ class MainActivity : FlutterActivity() {
         sb.appendLine("无障碍服务已在系统里启用：${Store.accessibilityOn(this)}")
         sb.appendLine("家长放行中（暂不拦截）：${Store.parentFreeActive(this)}")
         sb.appendLine("放行时长设置：${Store.settingsFreeMin(this)} 分钟")
+        // 「按键过滤为什么不生效」的答案就在这一行：手势导航压根不产生按键事件
+        sb.appendLine("系统导航方式：${Store.navModeText(this)}")
         sb.appendLine("非白名单应用一露头就被送回桌面；「最近任务」那一屏直接退掉，孩子留在当前应用")
         sb.append(GuardAccessibilityService.taskKillReport())
+        sb.appendLine("放行的系统界面（状态栏、权限弹框等，这些露头不拦）：")
+        sb.append(GuardAccessibilityService.systemUiReport())
         sb.appendLine("放行的系统「选文件」界面（孩子从应用里点「选视频」必经这一屏，不当换应用处理）：")
         sb.append(GuardAccessibilityService.pickerReport())
         sb.appendLine("最近几次拦截见下面日志里的 [guard] 行")
@@ -954,7 +1004,10 @@ class MainActivity : FlutterActivity() {
         sb.append(GuardAccessibilityService.sessionReport(this))
         sb.appendLine()
         sb.appendLine("── 从应用回到桌面的判定现场（按 Home 键 / 按返回键退出应用都算）──")
-        sb.appendLine("挑战开关：回到桌面时（从别的应用逃回来）${Store.challengeOnHome(this)} / 启动应用 ${Store.challengeOnLaunch(this)}")
+        sb.appendLine(
+            "挑战开关：回到桌面时（从别的应用逃回来）${Store.challengeOnHome(this)} / 启动应用 ${Store.challengeOnLaunch(this)}" +
+                "（这两项都要「启动拦截」总闸打开才算数）"
+        )
         sb.appendLine("无障碍看到的当前前台：${fg() ?: "（还没记录）"}")
         sb.appendLine("桌面自己最后一次在最前面：${agoOf(Store.selfForegroundAt(this))}")
         sb.appendLine("别的应用最后一次在最前面：${agoOf(Store.otherForegroundAt(this))}")
@@ -974,12 +1027,19 @@ class MainActivity : FlutterActivity() {
         sb.appendLine("【最结实的那路证据】无障碍记的窗口链：")
         sb.append(GuardAccessibilityService.frontReport(this))
         sb.appendLine()
-        sb.appendLine("── 白名单（★ = 点开直接进，不弹挑战）──")
+        sb.appendLine("── 白名单（★ = 点开直接进不弹挑战，☆ = 退回桌面不弹挑战，○ = 桌面不给图标入口）──")
         val noCh = Store.noChallenge(this)
+        val freeExit = Store.freeExit(this)
+        val hideIcon = Store.hideIcon(this)
         val allowedList = Store.allowed(this)
         sb.appendLine(
             if (allowedList.isEmpty()) "  （空，孩子只能看到家长设置）"
-            else allowedList.joinToString("\n") { p -> (if (p in noCh) "  ★ " else "  · ") + p }
+            else allowedList.joinToString("\n") { p ->
+                val marks = (if (p in noCh) "★" else "") +
+                    (if (p in freeExit) "☆" else "") +
+                    (if (p in hideIcon) "○" else "")
+                "  ${marks.ifEmpty { "·" }} " + p
+            }
         )
         sb.appendLine()
         sb.appendLine("── 文件传输（浏览器连本机下载日志 / 上传文件）──")
