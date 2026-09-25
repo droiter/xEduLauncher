@@ -36,14 +36,21 @@ class LauncherConfig {
   bool hasOverlay;
   bool guardEnabled;
 
-  /// 前台守护：非白名单应用一进前台就送回桌面（需无障碍权限）
+  /// 「不让非白名单应用启动」：非白名单应用一进前台就送回桌面（需无障碍权限）。
+  /// **缺省关着**，和 [launchGuard] 互相独立
   bool frontGuard;
 
-  /// 「启动拦截」总闸。**缺省关着**：关着时整机不设防——不弹回桌面、不弹挑战、不弹密码页
+  /// 「系统拦截」。**缺省关着**：关着时点开应用、从应用回桌面、超时（时长/次数用满）
+  /// 这些框一个都不弹，任务键也能看到最近任务
   bool launchGuard;
 
-  /// 「测试拦截」还剩多少秒（0 = 没在测试）。测试期间按总闸已打开来拦，到时自动关
+  /// 「测试拦截」还剩多少秒（0 = 没在测试）。测试期间两个开关都按打开算，到时自动关
   int testGuardLeftSec;
+
+  /// 「允许应用跳转」。**缺省关着**（＝照旧拦）。打开后，从白名单应用里点开的另一个应用
+  /// 不再被弹回桌面（文件管理器里点 apk 弹出的安装界面、应用里点链接拉起的浏览器…）。
+  /// 只认一跳：从那个应用再往外点开的第三个应用照旧拦
+  bool allowChildLaunch;
 
   /// 无障碍服务当前是否已在系统里启用
   bool accessibilityOn;
@@ -84,6 +91,7 @@ class LauncherConfig {
     this.frontGuard = false,
     this.launchGuard = false,
     this.testGuardLeftSec = 0,
+    this.allowChildLaunch = false,
     this.accessibilityOn = false,
     this.settingsFreeMin = 10,
     this.fileServerOn = false,
@@ -115,6 +123,7 @@ class LauncherConfig {
     frontGuard: m['frontGuard'] as bool? ?? false,
     launchGuard: m['launchGuard'] as bool? ?? false,
     testGuardLeftSec: (m['testGuardLeftSec'] as num?)?.toInt() ?? 0,
+    allowChildLaunch: m['allowChildLaunch'] as bool? ?? false,
     accessibilityOn: m['accessibilityOn'] as bool? ?? false,
     settingsFreeMin: (m['settingsFreeMin'] as num?)?.toInt() ?? 10,
     fileServerOn: m['fileServerOn'] as bool? ?? false,
@@ -140,9 +149,12 @@ class LauncherConfig {
   bool get timeLimitOn => dailyLimitMin > 0;
   bool get openLimitOn => openLimit > 0;
 
-  /// 拦截此刻生不生效（总闸开着，或在「测试拦截」的几分钟里）。
-  /// 注意这只是配置快照：到点那一刻前后要拿准，用 Native.interceptionOn() 现问原生侧
-  bool get interceptionOn => launchGuard || testGuardLeftSec > 0;
+  /// 「系统拦截」此刻生不生效（开关开着，或在「测试拦截」的几分钟里）。
+  /// 注意这只是配置快照：到点那一刻前后要拿准，用 Native.sysInterceptOn() 现问原生侧
+  bool get sysInterceptOn => launchGuard || testGuardLeftSec > 0;
+
+  /// 「不让非白名单应用启动」此刻生不生效（同样含「测试拦截」的几分钟）
+  bool get appBlockOn => frontGuard || testGuardLeftSec > 0;
 
   String get challengeLabel => switch (challengeType) {
     'none' => '不需要挑战',

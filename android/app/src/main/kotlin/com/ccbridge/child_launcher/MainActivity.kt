@@ -152,7 +152,17 @@ class MainActivity : FlutterActivity() {
         // 读到的仍是「这一下之前」的状态），而且能把「按返回键退出应用」那次一并判掉——
         // 那次系统根本不发 intent，只有 onResume 这条路看得见。这里只记一笔「这一下是 Home」，
         // 好在判定和日志里说清楚是哪一种。
-        viaHomeIntent = true
+        // 桌面本来就在前台时不留这个标记：那一下不会有 onResume 来消费它，留着的下场是
+        // 下一次「按返回键退出应用回到桌面」被当成「按 Home 键」——挑战框上会写错。
+        // （桌面在后台的那一下才需要它，见下面 onResume）
+        viaHomeIntent = !inForeground
+        // 桌面本来就摆在自己面前时（家长设置/选应用这些页面压在上面），这一下 Home 是冲着
+        // 「回到桌面」来的——桌面这个 Activity 从头到尾没离开前台，系统不会走 onResume，
+        // 光靠上面那条判定什么都不会发生，页面就一直压着（2026-09-25 owner 反馈）。
+        // 通知 Dart 把压着的页面全退掉。孩子从别的应用按 Home 回来那一下也发：先把遗留的页面
+        // 退干净，紧接着 onResume 该弹的挑战框照弹（框是 Dart 弹的，排在这次退页面之后）。
+        Diag.log("act", "onNewIntent：按 Home 键（桌面在前台=$inForeground），通知界面退掉压着的页面")
+        notifyDart("onHomePressed", "按 Home 键（桌面已在前台）")
     }
 
     private fun fg(): String? = Store.currentForeground(this)
@@ -197,10 +207,10 @@ class MainActivity : FlutterActivity() {
         val viaHome = viaHomeIntent
 
         val verdict = when {
-            // 总闸关着（家长自己用平板，或者「测试拦截」到点了）：从应用回桌面不弹挑战，
+            // 「系统拦截」关着（家长自己用平板，或者「测试拦截」到点了）：从应用回桌面不弹挑战，
             // 孩子按 Home / 按返回键退出应用都直接进桌面。这一条排在最前面——
-            // 它是「拦截此刻生不生效」的总判据，其它证据再结实也轮不上
-            !Store.interceptionOn(this) -> false to "「启动拦截」总闸关着（也没在测试拦截中），不拦"
+            // 它是这一层拦截生不生效的总判据，其它证据再结实也轮不上
+            !Store.sysInterceptOn(this) -> false to "「系统拦截」关着（也没在测试拦截中），不拦"
             // 守护自己刚把他弹回来的那次（孩子开了非白名单应用）不算他按的 Home，拦回桌面就完事
             Store.guardBounceRecent(this) -> false to "守护刚把他弹回桌面"
             // 「最近任务」那一屏刚露过头（按任务键带出来的）。那一屏会把桌面顶成 onStop/onPause，
@@ -219,9 +229,12 @@ class MainActivity : FlutterActivity() {
             // 兜底证据前面：兜底只看「Activity 离开前台多久」，而这两个页面必然把
             // MainActivity 压下去好几秒，一关就成了「离开前台 >1.2 秒」的假证据
             coveredByOwnPage -> false to "刚盖在上面的是本应用自己的家长页面（密码页/同意页）"
-            // 「」= 无障碍看见桌面之前是本应用自己的页面（密码页/乘法挑战页/同意页盖在上面），
-            // 那不是从应用里逃出来的——这条要排在兜底证据前面，否则锁屏页一关就误判成逃回桌面
-            before != null && before.isEmpty() -> false to "刚才盖在上面的是本应用自己的页面"
+            // 「」= 无障碍看见桌面之前那个窗口不是孩子的应用：本应用自己的页面（密码页/乘法
+            // 挑战页/同意页盖在上面）、别家桌面及其过渡容器、输入法、系统界面都归这一类
+            // （见 GuardAccessibilityService.notChildWindow）。那不是从应用里逃出来的——这条要
+            // 排在兜底证据前面，否则锁屏页一关、或者中间只飘过几个系统窗口，就误判成逃回桌面
+            before != null && before.isEmpty() ->
+                false to "桌面之前那个窗口不是孩子的应用（本应用页面/别家桌面/输入法/系统界面）"
             // 家长在这个应用上勾了「退回桌面时不弹挑战」：他从这个应用里按 Home / 按返回键
             // 退出来就是可以直接到桌面。这条要排在下面那条通用判据前面——两条都是 from 白名单，
             // 差别只在家长逐个应用设的那个开关
@@ -543,7 +556,7 @@ class MainActivity : FlutterActivity() {
             // 拦截此刻生不生效（总闸开着，或在「测试拦截」的几分钟里）。
             // Dart 侧每次要弹挑战之前现问一次，不拿配置快照里那个会过期的值判——
             // 「测试拦截」到点的前前后后就差这几百毫秒
-            "interceptionOn" -> result.success(Store.interceptionOn(this))
+            "sysInterceptOn" -> result.success(Store.sysInterceptOn(this))
             // 开/关一次「测试拦截」（参数是分钟，<=0 就是关掉），回来时顺便把最新配置带上
             "setTestGuard" -> {
                 val before = Store.configMap(this)
@@ -745,7 +758,7 @@ class MainActivity : FlutterActivity() {
             Diag.log("home", "$why，但没有「刚才在用哪个应用」的记录，只能留在桌面")
             return false
         }
-        if (Store.frontGuard(this) && pkg !in Store.allowed(this)) {
+        if (Store.appBlockOn(this) && pkg !in Store.allowed(this)) {
             Diag.log("home", "$why，但 $pkg 已不在白名单，送回去也会被守护弹回来，留在桌面")
             return false
         }
@@ -971,33 +984,40 @@ class MainActivity : FlutterActivity() {
         }
         sb.appendLine("上次「默认桌面」尝试：${lastHomeOutcome ?: "（本次运行还没点过）"}")
         sb.appendLine()
-        sb.appendLine("── 拦截总闸 ──")
+        sb.appendLine("── 拦截的两个开关（互相独立）──")
         val left = Store.testGuardLeftSec(this)
         sb.appendLine(
-            "「启动拦截」总闸：" + if (Store.launchGuard(this)) "已打开" else "关着（缺省就是关的）"
+            "「系统拦截」：" + if (Store.launchGuard(this)) "已打开" else "关着（缺省就是关的）"
         )
         sb.appendLine(
-            "「测试拦截」：" + if (left > 0) "进行中，还剩 ${left}s（到时自动关）" else "没在测试"
+            "「不让非白名单应用启动」：" + if (Store.frontGuard(this)) "已打开" else "关着（缺省就是关的）"
         )
         sb.appendLine(
-            "⇒ 拦截此刻" + if (Store.interceptionOn(this)) "生 效" else "不生效：整机不设防（不弹回桌面、不弹挑战、不弹密码页）"
+            "「测试拦截」：" + if (left > 0) "进行中，还剩 ${left}s（到时自动关，两个都按打开算）" else "没在测试"
         )
-        sb.appendLine()
-        sb.appendLine("── 前台守护（拦非白名单应用 + 拒绝任务键）──")
-        sb.appendLine("管控此刻在生效吗：${GuardAccessibilityService.guardStateText(this)}")
+        sb.appendLine(
+            "⇒ 系统拦截" + if (Store.sysInterceptOn(this)) "生 效（点开应用/回桌面答题、超时弹框、任务列表照管）"
+            else "不生效（不弹挑战、不弹密码页、任务列表不挡）"
+        )
         sb.appendLine("「按任务键退掉最近任务」那一屏：${GuardAccessibilityService.taskKillStateText(this)}")
-        sb.appendLine("开关已打开：${Store.frontGuard(this)}")
+        sb.appendLine()
+        sb.appendLine("── 不让非白名单应用启动（露头就送回桌面）──")
+        sb.appendLine("管控此刻在生效吗：${GuardAccessibilityService.guardStateText(this)}")
+        sb.appendLine("⇒ 不让启动这条" + if (Store.appBlockOn(this)) "开 着" else "关着")
         sb.appendLine("无障碍服务已在系统里启用：${Store.accessibilityOn(this)}")
         sb.appendLine("家长放行中（暂不拦截）：${Store.parentFreeActive(this)}")
         sb.appendLine("放行时长设置：${Store.settingsFreeMin(this)} 分钟")
         // 「按键过滤为什么不生效」的答案就在这一行：手势导航压根不产生按键事件
         sb.appendLine("系统导航方式：${Store.navModeText(this)}")
-        sb.appendLine("非白名单应用一露头就被送回桌面；「最近任务」那一屏直接退掉，孩子留在当前应用")
+        sb.appendLine("非白名单应用一露头就被送回桌面（归「不让非白名单应用启动」）；")
+        sb.appendLine("「最近任务」那一屏直接退掉、孩子留在当前应用（归「系统拦截」）")
         sb.append(GuardAccessibilityService.taskKillReport())
         sb.appendLine("放行的系统界面（状态栏、权限弹框等，这些露头不拦）：")
         sb.append(GuardAccessibilityService.systemUiReport())
         sb.appendLine("放行的系统「选文件」界面（孩子从应用里点「选视频」必经这一屏，不当换应用处理）：")
         sb.append(GuardAccessibilityService.pickerReport())
+        sb.appendLine("「允许应用跳转」（白名单应用里点开的其它应用，比如文件管理器里点 apk 弹出的安装界面）：")
+        sb.append(GuardAccessibilityService.childLaunchReport(this))
         sb.appendLine("最近几次拦截见下面日志里的 [guard] 行")
         sb.appendLine()
         sb.appendLine("── 单次使用时长（每个白名单应用各算一次）──")
@@ -1151,5 +1171,27 @@ class MainActivity : FlutterActivity() {
 
         /** 桌面这次回到最前面之前真的离开过屏幕（onStop）的时刻，0 = 没有 */
         private var leftScreenAt = 0L
+
+        /**
+         * 本应用自己的家长页面（密码页/同意页）关掉了：把「桌面离开过屏幕 / 离开过前台」这两条
+         * 现场清一次。它们必然是那两个页面盖在桌面上时记下的——桌面被自己的页面压下去不算
+         * 「他去了别处」，可证据一挂上就留到下一次露面，桌面回到最前面时孩子什么都没做，
+         * 却会被判成「他刚从别处回来」白弹一道挑战框（2026-09-24 真机 21:45:40 就是这么弹的：
+         * 密码页关掉那一秒 `showing` 已经翻成 false，紧接着 onStop 记的 leftScreen 没有任何保护，
+         * 兜底判据 11 秒后拿它当证据）。两句都清：兜底那几条只要有一条成立就会弹。
+         */
+        fun noteOwnPageClosed(page: String) {
+            if (leftScreenAt == 0L && leftForegroundAt == 0L) return
+            val now = SystemClock.elapsedRealtime()
+            Diag.log(
+                "home",
+                "$page 关掉，作废「桌面离开过屏幕/前台」的证据（leftScreen=" +
+                    (if (leftScreenAt == 0L) "没记过" else "${now - leftScreenAt}ms 前") + "、" +
+                    "leftFg=" + (if (leftForegroundAt == 0L) "没记过" else "${now - leftForegroundAt}ms 前") +
+                    "）",
+            )
+            leftScreenAt = 0L
+            leftForegroundAt = 0L
+        }
     }
 }

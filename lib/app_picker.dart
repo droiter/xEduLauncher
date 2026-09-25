@@ -22,6 +22,9 @@ class AppPickerResult {
 
 /// 从已安装应用里挑选允许孩子访问的清单，并逐个决定三件事：打开时要不要弹挑战、
 /// 从这个应用退回桌面时要不要弹挑战、要不要把图标摆到孩子的桌面上。
+///
+/// 这个页面**没有保存按钮**：勾一下、拨一下开关就立刻通过 [onChanged] 交给家长设置页
+/// 落盘，所以家长改完直接按返回就行，不用记着「还没保存」。
 class AppPickerScreen extends StatefulWidget {
   const AppPickerScreen({
     super.key,
@@ -29,12 +32,16 @@ class AppPickerScreen extends StatefulWidget {
     required this.noChallenge,
     required this.freeExit,
     required this.hideIcon,
+    required this.onChanged,
   });
 
   final List<String> selected;
   final List<String> noChallenge;
   final List<String> freeExit;
   final List<String> hideIcon;
+
+  /// 每改一下就回调一次（带着四个清单的完整快照），由调用方立刻写进配置
+  final ValueChanged<AppPickerResult> onChanged;
 
   @override
   State<AppPickerScreen> createState() => _AppPickerScreenState();
@@ -82,14 +89,16 @@ class _AppPickerScreenState extends State<AppPickerScreen> {
         _hidden.remove(pkg);
       }
     });
+    _emit();
   }
 
-  void _save() {
+  /// 四个清单一起交出去：原生侧要靠 allowed 清掉已经被移除应用的免挑战/随意退出/不给图标配置
+  void _emit() {
     final allowed = _picked.toList()..sort();
     final free = _free.where(_picked.contains).toList()..sort();
     final exitFree = _exitFree.where(_picked.contains).toList()..sort();
     final hidden = _hidden.where(_picked.contains).toList()..sort();
-    Navigator.of(context).pop(
+    widget.onChanged(
       AppPickerResult(
         allowed: allowed,
         noChallenge: free,
@@ -99,8 +108,21 @@ class _AppPickerScreenState extends State<AppPickerScreen> {
     );
   }
 
-  /// 一行里挤三个开关：用 10sp 小字标出各自管什么，开关本身缩到 42×30，
-  /// 免得把应用名挤没了（FittedBox 连布局尺寸一起缩，不给列表撑高）
+  /// 家长设置页已经过了密码这道门，这里直接拉起应用：不用再答题，也不算「孩子点开的」。
+  /// 应用不在白名单、「不让非白名单应用启动」又开着的话，它会被守护弹回桌面——那是原有机制，这里不特殊放行
+  Future<void> _open(InstalledApp a) async {
+    Native.log('从白名单页直接打开「${a.label}」（${a.package}）');
+    final ok = await Native.launchApp(a.package);
+    if (!ok && mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('无法打开 ${a.label}')));
+    }
+  }
+
+  /// 一行里挤三个开关：用 10sp 小字标出各自管什么，开关本身缩到 38×30，
+  /// 免得把应用名挤没了（FittedBox 连布局尺寸一起缩，不给列表撑高）。
+  /// 末尾还要再塞一个「打开」按钮，所以比早先又收窄了 4dp
   Widget _miniSwitch(
     String label, {
     required bool value,
@@ -112,12 +134,25 @@ class _AppPickerScreenState extends State<AppPickerScreen> {
         Text(label, style: TextStyle(fontSize: 10, color: Theme.of(context).hintColor)),
         SizedBox(
           height: 30,
-          width: 42,
+          width: 38,
           child: FittedBox(
             child: Switch(value: value, onChanged: onChanged),
           ),
         ),
       ],
+    );
+  }
+
+  /// 每一行末尾那个「打开」：家长在这台设备上直接启动这个应用，先把它配好（登录、给权限…）
+  Widget _openButton(InstalledApp a) {
+    return IconButton(
+      onPressed: () => _open(a),
+      icon: const Icon(Icons.open_in_new),
+      iconSize: 20,
+      tooltip: '直接打开「${a.label}」',
+      padding: EdgeInsets.zero,
+      visualDensity: VisualDensity.compact,
+      constraints: const BoxConstraints.tightFor(width: 34, height: 34),
     );
   }
 
@@ -153,10 +188,7 @@ class _AppPickerScreenState extends State<AppPickerScreen> {
     final hiddenCount = _hidden.where(_picked.contains).length;
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('允许访问的应用'),
-        actions: [TextButton(onPressed: _save, child: const Text('保存'))],
-      ),
+      appBar: AppBar(title: const Text('允许访问的应用')),
       body: Column(
         children: [
           Padding(
@@ -188,6 +220,9 @@ class _AppPickerScreenState extends State<AppPickerScreen> {
                           children: [
                             Checkbox(
                               value: picked,
+                              visualDensity: VisualDensity.compact,
+                              materialTapTargetSize:
+                                  MaterialTapTargetSize.shrinkWrap,
                               onChanged: (v) => _toggle(a.package, v == true),
                             ),
                             _icon(a.package),
@@ -209,48 +244,59 @@ class _AppPickerScreenState extends State<AppPickerScreen> {
                                 : null,
                           ),
                         ),
-                        trailing: picked
-                            ? Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  _miniSwitch(
-                                    '进入',
-                                    value: !free,
-                                    onChanged: (v) => setState(() {
-                                      if (v) {
-                                        _free.remove(a.package);
-                                      } else {
-                                        _free.add(a.package);
-                                      }
-                                    }),
-                                  ),
-                                  const SizedBox(width: 4),
-                                  _miniSwitch(
-                                    '退出',
-                                    value: !exitFree,
-                                    onChanged: (v) => setState(() {
-                                      if (v) {
-                                        _exitFree.remove(a.package);
-                                      } else {
-                                        _exitFree.add(a.package);
-                                      }
-                                    }),
-                                  ),
-                                  const SizedBox(width: 4),
-                                  _miniSwitch(
-                                    '显示',
-                                    value: !hidden,
-                                    onChanged: (v) => setState(() {
-                                      if (v) {
-                                        _hidden.remove(a.package);
-                                      } else {
-                                        _hidden.add(a.package);
-                                      }
-                                    }),
-                                  ),
-                                ],
-                              )
-                            : null,
+                        trailing: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            if (picked) ...[
+                              _miniSwitch(
+                                '进入',
+                                value: !free,
+                                onChanged: (v) {
+                                  setState(() {
+                                    if (v) {
+                                      _free.remove(a.package);
+                                    } else {
+                                      _free.add(a.package);
+                                    }
+                                  });
+                                  _emit();
+                                },
+                              ),
+                              const SizedBox(width: 3),
+                              _miniSwitch(
+                                '退出',
+                                value: !exitFree,
+                                onChanged: (v) {
+                                  setState(() {
+                                    if (v) {
+                                      _exitFree.remove(a.package);
+                                    } else {
+                                      _exitFree.add(a.package);
+                                    }
+                                  });
+                                  _emit();
+                                },
+                              ),
+                              const SizedBox(width: 3),
+                              _miniSwitch(
+                                '显示',
+                                value: !hidden,
+                                onChanged: (v) {
+                                  setState(() {
+                                    if (v) {
+                                      _hidden.remove(a.package);
+                                    } else {
+                                      _hidden.add(a.package);
+                                    }
+                                  });
+                                  _emit();
+                                },
+                              ),
+                              const SizedBox(width: 3),
+                            ],
+                            _openButton(a),
+                          ],
+                        ),
                         onTap: () => _toggle(a.package, !picked),
                       );
                     },
@@ -269,6 +315,10 @@ class _AppPickerScreenState extends State<AppPickerScreen> {
                   ),
                   const SizedBox(height: 4),
                   Text(
+                    '勾选、拨开关立刻就生效，不用保存，改完直接返回即可。\n'
+                    '每行右边的 ⧉ 按钮 = 在这台设备上直接打开这个应用（不用答题），'
+                    '方便你先把应用里的登录、权限配好；非白名单应用若被「不让非白名单应用启动」挡下，'
+                    '它会立刻被送回桌面，属正常。\n'
                     '「进入」开关打开 = 点开这个应用要先过挑战，关掉则直接进。\n'
                     '「退出」开关打开 = 他在这个应用里按 Home 键、或一路按返回键退回桌面时要先过挑战；'
                     '关掉则随时可以退出来、直接落到桌面。\n'

@@ -127,6 +127,9 @@ class LockActivity : Activity() {
 
     override fun onDestroy() {
         showing = false
+        // 这一页盖在桌面上时，桌面被压出去的「离开过屏幕/前台」不算「他去了别处」——
+        // 关页时把那两条现场作废，见 MainActivity.noteOwnPageClosed
+        MainActivity.noteOwnPageClosed("密码页")
         super.onDestroy()
     }
 

@@ -232,6 +232,19 @@ class GuardAccessibilityService : AccessibilityService() {
      */
     private var frontAppPkg: String? = null
 
+    /**
+     * 「允许应用跳转」开关打开时，被放行的那个「白名单应用点开的应用」。见 [childLaunchReason]。
+     *
+     * 它记的是**这一次跳转**，不是一条长期白名单：孩子回到桌面（[onDesktopShown]）或回到
+     * 任何一个白名单应用（[onAccessibilityEvent] 里 childApp 那一段）就作废。这样那个应用
+     * 自己的后续窗口（弹个对话框、翻到下一页）照样放行，而它再往外点开的第三个应用
+     * 不会被当成「又是白名单点开的」——只认一跳。
+     */
+    private var launchedFromWhitelist: String? = null
+
+    /** 上一次跳转是从哪个白名单应用点开的（写日志与自检报告用） */
+    private var launchedFromPkg: String? = null
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         // 本服务可能是这个进程里第一个起来的（开机后系统直接绑定无障碍服务，还没人打开桌面），
@@ -411,7 +424,7 @@ class GuardAccessibilityService : AccessibilityService() {
                 val offTask = taskKillOffReason()
                 if (offTask != null) {
                     taskSkippedOff++
-                    logThrottled(offTask, "任务键：这一屏本该退掉，但$offTask，只能放过")
+                    logThrottled(offTask, "任务键：这一屏不动手——$offTask")
                 } else {
                     handleTaskScreen(pkg, cls)
                 }
@@ -432,12 +445,32 @@ class GuardAccessibilityService : AccessibilityService() {
         // 单次使用时长：只有白名单应用的窗口才算「孩子在用它」。输入法、电话、状态栏、
         // 别的桌面（露头＝他按了任务键）这些一闪而过的窗口不算换应用，会话不动
         val childApp = pkg in Store.allowed(this)
+        // 「上一个真正在前面的应用」在下面那行更新之前取走：判「这个应用是不是白名单应用点开的」
+        // 用的就是它（见 childLaunchReason）。输入法、状态栏、别的桌面都不会更新 frontAppPkg，
+        // 所以文件管理器长按菜单时那些 launcher 过渡窗口不会把它冲掉
+        val prevApp = frontAppPkg
+        // 白名单应用**把别的应用拉到前面**时，它自己会在动画里补报一条光秃秃的容器窗口
+        // （模拟器 2026-09-23 实测：浏览器拉起系统设置之后紧跟一条 `tabletbrowser/FrameLayout`）。
+        // 那一下不是「孩子回到了这个应用」，两个后果都很难看：
+        //   ① 前台应用窗口被挪回去 → 单次计时跟着续上，孩子在那个被放行的应用里时表还在走；
+        //   ② 上一条「跳转放行」被作废 → 从被放行的那个应用还能再往外点一跳，一跳变两跳。
+        // 只对**白名单应用自己的**这类窗口这么处理（见 [isTransitionClass]）；别的应用照旧，
+        // 它们的窗口类名本来就不是容器
+        val appWindow = !(childApp && isTransitionClass(cls))
         // 只有「真是一个应用窗口」才更新这条：单次时长的走表靠它判断孩子还在不在那个应用里
-        if (childApp || foreign) frontAppPkg = pkg
-        if (childApp) {
-            startSession(pkg)
-        } else if (foreign) {
-            pauseSession("切到了 $pkg")
+        if ((childApp || foreign) && appWindow) frontAppPkg = pkg
+        when {
+            childApp && !appWindow -> logThrottled(
+                "childAppTransition",
+                "白名单应用 $pkg/${cls.substringAfterLast('.')} 的过渡窗口露头，" +
+                    "不当成「孩子回到这个应用」（计时不续、跳转记号不作废）",
+            )
+            childApp -> {
+                // 孩子回到白名单应用里了：上一次那个「点开的应用」到此为止，它再往外点就得重新审
+                launchedFromWhitelist = null
+                startSession(pkg)
+            }
+            foreign -> pauseSession("切到了 $pkg")
         }
 
         // 「最近任务」优先处理，而且不跟下面那条防连环弹的节流共用计数器（见 lastBounceAt）。
@@ -469,6 +502,14 @@ class GuardAccessibilityService : AccessibilityService() {
         val routine = allowedReason(pkg, ime, dialer)
         if (routine != null) {
             logThrottled("$pkg|$routine", "放行 $pkg/${cls.substringAfterLast('.')}：$routine")
+            return
+        }
+        // 「允许应用跳转」打开时，白名单应用点开的那个应用不弹回桌面（见 childLaunchReason）。
+        // 排在防连环弹那条节流**之前**：那一条是给「连着拦两个应用」准备的，不该把这一下吞掉
+        val jump = childLaunchReason(pkg, prevApp)
+        if (jump != null) {
+            logThrottled("$pkg|jump", "放行 $pkg/${cls.substringAfterLast('.')}：$jump")
+            Audit.record(Audit.LAUNCH, pkg, "白名单应用点开的应用，这次不弹回桌面（$jump）")
             return
         }
 
@@ -542,7 +583,16 @@ class GuardAccessibilityService : AccessibilityService() {
         if (isRecentsClass(cls) || overlayShowing()) return
         launcherFrontAt = SystemClock.elapsedRealtime()
         beforeLauncherPkg = prevFrontPkg
-        Diag.log("guard", "桌面露头：之前最前面的是 ${prevFrontPkg ?: "（没记上）"}")
+        val prevWin = prevFrontPkg
+        Diag.log(
+            "guard",
+            "桌面露头：之前最前面的是 ${prevWin ?: "（没记上）"}" +
+                if (prevWin != null && notChildWindow(prevWin)) {
+                    "（不是孩子的应用：本应用页面/别家桌面/输入法/系统界面 → 桌面按「不打扰」算）"
+                } else {
+                    ""
+                },
+        )
     }
 
     /** 本应用那几个「盖在桌面上」的页面有没有正在显示的 */
@@ -552,46 +602,75 @@ class GuardAccessibilityService : AccessibilityService() {
     /**
      * 桌面这一次露头之前，最前面的是什么。返回值给 MainActivity 判「要不要弹挑战框」：
      *   null = 看不出（服务没在跑，或桌面本来就站在最前面，不是在这次才盖上来）；
-     *   ""   = 是本应用自己的页面（密码页之类），不是从应用里逃出来的；
+     *   ""   = 桌面之前那个窗口不是孩子的应用（本应用自己的页面、别家桌面及其过渡容器、
+     *          输入法、系统界面），不是从应用里逃出来的；
      *   其它 = 那个包的包名——孩子是不是用着它，由桌面拿白名单去比。
      */
     private fun windowBeforeLauncher(launcherPkg: String): String? {
         val f = frontPkg
         // 服务还没看见桌面露头：它记的前台还是那个应用，说明桌面是刚盖上去的
-        if (f != null && f != launcherPkg) return f
+        if (f != null && f != launcherPkg) return if (notChildWindow(f)) "" else f
         // 服务看见了：只认「刚露头」的那一下。站在桌面上好一会儿了的不翻旧账，
         // 否则孩子站在桌面按一次 Home 就会把上一次用过的应用翻出来弹题
         if (SystemClock.elapsedRealtime() - launcherFrontAt > LAUNCHER_FRESH_MS) return null
         val prev = beforeLauncherPkg ?: return null
-        return if (prev == launcherPkg) "" else prev
+        if (prev == launcherPkg || notChildWindow(prev)) return ""
+        return prev
     }
 
     /**
-     * 管控此刻**没**在生效的原因；生效时返回 null。
+     * 这个窗口包名是不是「不是孩子的那类窗口」：本应用自己、别家桌面（三星的
+     * `com.sec.android.app.launcher`，连带它那个光秃秃的过渡容器 `FrameLayout`）、输入法、系统界面。
      *
-     * 这三条以前都是静默 return true，日志里看不出任何痕迹——「该拦的应用没拦」「按任务键
-     * 还能看到任务列表」十有八九就撞在这上面（最常见的是无障碍被系统关掉、本应用没设成默认桌面，
+     * 它们夹在孩子的应用和桌面中间不代表孩子换过应用。以前只把输入法/系统界面挡在窗口链
+     * **外面**（见 [noteFrontWindow]），别家桌面那条没挡：桌面露头时记下的「之前最前面的是谁」
+     * 就成了别家桌面，桌面拿白名单比不中，一路滑到「离开屏幕多久」那条兜底证据上去判，
+     * 于是白弹一道挑战框（2026-09-24 真机 21:45:40 就是这么弹的：家长输完密码关掉密码页，
+     * 中间只有 systemui / 输入法 / 三星桌面的过渡窗口，一个应用都没露过面）。
+     * 现在统一按「不是孩子的应用」处理，由桌面直接判「不打扰」。
+     */
+    private fun notChildWindow(pkg: String): Boolean =
+        pkg == packageName || pkg in otherHomeApps() ||
+            pkg == SYSTEM_UI_PKG || pkg in inputMethodPackages()
+
+    /**
+     * 拦非白名单应用这件事此刻**没**在生效的原因；生效时返回 null。
+     *
+     * 只问「不让非白名单应用启动」那一个开关（[Store.appBlockOn]，含「测试拦截」）——
+     * 任务列表、各种挑战框归「系统拦截」管，见 [taskKillOffReason]，两个开关互相独立。
+     *
+     * 这几条以前都是静默 return true，日志里看不出任何痕迹——「该拦的应用没拦」
+     * 十有八九就撞在这上面（最常见的是无障碍被系统关掉、本应用没设成默认桌面，
      * 家长在自检报告里只能看到一句「开关已打开」，看不出其实整体没生效）。
      */
     private fun guardOffReason(): String? {
-        if (!Store.interceptionOn(this)) return "「启动拦截」总闸没打开（也没在测试拦截中）"
-        if (!Store.frontGuard(this)) return "「前台守护」开关没打开"
+        if (!Store.appBlockOn(this)) return "「不让非白名单应用启动」开关没打开（也没在测试拦截中）"
         if (Store.parentFreeActive(this)) return "家长放行期内（去过系统设置还没回来）"
         if (!Store.isDefaultLauncher(this)) return "本应用不是系统默认桌面"
         return null
     }
 
     /**
-     * 「处置最近任务那一屏」这件事没在生效的原因。**故意不问「是不是默认桌面」**：
-     * 孩子在应用里按的那一路发的是返回键，谁当桌面都成立——本应用没被设成默认桌面时，
-     * 孩子照样不该看到任务列表。2026-09-16 的真机日志里，那条判据翻车时任务列表被白白放过了
-     * 7 个多小时（日志原话：「任务键：这一屏本该退掉，但本应用不是系统默认桌面，只能放过」）。
-     * 拦截非白名单应用那条路仍然要默认桌面，见 [guardOffReason]。
+     * 「处置最近任务那一屏」这件事没在生效的原因。生效时返回 null。
+     *
+     * **要问「是不是默认桌面」**（2026-09-23 owner 定的）。本应用不是默认桌面时，任务键
+     * 归那个桌面自己管：孩子按任务键看到的是**别人家桌面的最近任务**，而那一屏和它自己的
+     * 主页长得一样（都归那个桌面包名），我们的判据分不出两者——[isTaskSwitchScreen] 只认
+     * 「包名在 HOME 候选里」，于是那个桌面的**主页**也被当成「最近任务那一屏」：
+     * 孩子按 Home 回到自己家桌面，屏幕上会盖起一块挡板、还顶着不动手（[taskScreenStillUp]
+     * 一直为真），直到 [TASK_BLOCKER_MAX_MS] 那 8 秒预算烧完。owner 的原话：
+     * 「把三星桌面设为默认桌面，按任务键，home 键仍会出现白色挡板，这个不应该」。
+     * 拦非白名单应用那条路本来就问同一件事，见 [guardOffReason]。
+     *
+     * 2026-09-16 那版**故意不问**（理由：「孩子在应用里按的那一路发的是返回键，谁当桌面都成立」），
+     * 那是因为当时默认桌面的判据本身在翻车（[Store.isDefaultLauncher] 会间歇性解析到别人家），
+     * 宁可不问。那个 bug 1.0.17 已经修掉（RoleManager 权威判据 → 带 MATCH_DEFAULT_ONLY 的解析
+     * → 不带过滤的解析 → 30 秒进程内缓冲），现在问它是安全的。
      */
     private fun taskKillOffReason(): String? {
-        if (!Store.interceptionOn(this)) return "「启动拦截」总闸没打开（也没在测试拦截中）"
-        if (!Store.frontGuard(this)) return "「前台守护」开关没打开"
+        if (!Store.sysInterceptOn(this)) return "「系统拦截」没打开（也没在测试拦截中）"
         if (Store.parentFreeActive(this)) return "家长放行期内（去过系统设置还没回来）"
+        if (!Store.isDefaultLauncher(this)) return "本应用不是系统默认桌面（任务键归那个桌面自己管）"
         return null
     }
 
@@ -759,7 +838,7 @@ class GuardAccessibilityService : AccessibilityService() {
      *
      * 补刀**不再有次数上限**（原来 2 次）：只要还在盖着，就说明孩子还在那一屏上，停下才是错的。
      * 上限改成时间预算 [TASK_BLOCKER_MAX_MS]——我们的簿记万一过期（系统不再发窗口事件），
-     * 也得有个头，不能把孩子一直困在灰屏上。
+     * 也得有个头，不能把孩子一直困在挡板上。
      */
     private val taskFollowUp: Runnable = Runnable {
         val startedAt = taskFollowUpAt
@@ -961,6 +1040,43 @@ class GuardAccessibilityService : AccessibilityService() {
         return null
     }
 
+    /**
+     * 「这个应用是白名单应用点开的吗」。命中就放行（不弹回桌面），理由作为字符串返回。
+     * 家长没打开「允许应用跳转」时一律返回 null，一个字节的行为都不变。
+     *
+     * **它解决的是哪件事**：孩子（或家长）在白名单应用里点开另一个应用——文件管理器里点 apk
+     * 弹出的安装界面（`com.samsung.android.packageinstaller`）、应用里点链接拉起的浏览器、
+     * 分享出去的目标应用——这些都不是孩子自己在桌面上点开的，可守护只看「前台这个包在不在
+     * 白名单里」，连安装界面都照样弹回桌面。2026-09-23 owner 报的就是这一条（在文件管理器里
+     * 装 apk 被弹回去）。
+     *
+     * **只认一跳**，两个条件命中一个才算：
+     *  ① [launchedFromWhitelist] 就是它自己——它弹了个框、翻到下一页，还是同一个包，继续放行；
+     *  ② 上一个真正在前面的**应用**（[prevApp]，不是窗口链）是白名单应用。
+     *    这里故意不用窗口链 [frontPkg]：文件管理器长按文件弹菜单时会产生别的桌面的过渡窗口
+     *    （`com.sec.android.app.launcher/FrameLayout`，见第 50 条那次事故），窗口链在那时指向
+     *    launcher，比不中白名单——而那正是孩子点 apk 之前的现场。
+     * 从被放行的那个应用再往外点开的第三个应用两条都不成立（②里的 prevApp 已经变成它自己），照旧拦。
+     *
+     * **放行 ≠ 当界面看**：它照样按「别的应用」记账——[Store.noteForeground] 记成应用、
+     * 单次计时跟着暂停（回到白名单应用接着算）、回桌面那一下照样可能弹挑战。这是有意的：
+     * 跳出去的那个应用不吃单次时长，换的是孩子不能拿它当跳板无限往下点。
+     */
+    private fun childLaunchReason(pkg: String, prevApp: String?): String? {
+        if (!Store.allowChildLaunch(this)) return null
+        // 别的桌面 / 「最近任务」那一屏由 killTaskScreen 管，放行它就等于把任务列表放出来
+        if (pkg in otherHomeApps()) return null
+        if (pkg == launchedFromWhitelist) {
+            return "${launchedFromPkg ?: "白名单应用"} 点开的那个应用（「允许应用跳转」打开着）"
+        }
+        if (prevApp != null && prevApp != pkg && prevApp in Store.allowed(this)) {
+            launchedFromWhitelist = pkg
+            launchedFromPkg = prevApp
+            return "它是白名单应用 $prevApp 点开的（「允许应用跳转」打开着）"
+        }
+        return null
+    }
+
     private fun defaultDialer(): String? = try {
         (getSystemService(TELECOM_SERVICE) as? android.telecom.TelecomManager)
             ?.defaultDialerPackage
@@ -997,9 +1113,9 @@ class GuardAccessibilityService : AccessibilityService() {
 
     /** 孩子打开了 [pkg]（或从别处切回来）：会话切到它，接着上一次用剩下的时间往下数 */
     private fun startSession(pkg: String) {
-        // 总闸关着（家长自己用平板，或者「测试拦截」到点了）：一个表都不走、一个题都不弹
-        if (!Store.interceptionOn(this)) {
-            if (sessionPkg != null) pauseSession("「启动拦截」总闸关着")
+        // 「系统拦截」关着（家长自己用平板，或者「测试拦截」到点了）：一个表都不走、一个题都不弹
+        if (!Store.sysInterceptOn(this)) {
+            if (sessionPkg != null) pauseSession("「系统拦截」关着")
             return
         }
         // 挑战页其实已经不在屏幕上了（被系统回收/进程走过一遭）：把「在等答题」这个标记清掉，
@@ -1054,7 +1170,7 @@ class GuardAccessibilityService : AccessibilityService() {
     private fun arm() {
         handler.removeCallbacks(sessionTick)
         if (sessionPkg == null) return
-        if (!Store.interceptionOn(this)) return
+        if (!Store.sysInterceptOn(this)) return
         if (Store.singleUseMin(this) <= 0) return
         handler.postDelayed(sessionTick, 1000L)
     }
@@ -1065,9 +1181,9 @@ class GuardAccessibilityService : AccessibilityService() {
      */
     private fun tickSession(): Boolean {
         val pkg = sessionPkg ?: return false
-        // 走表当中家长把总闸关了（或者「测试拦截」到点了）：表停在这一刻，剩余留着
-        if (!Store.interceptionOn(this)) {
-            pauseSession("「启动拦截」总闸关着")
+        // 走表当中家长把「系统拦截」关了（或者「测试拦截」到点了）：表停在这一刻，剩余留着
+        if (!Store.sysInterceptOn(this)) {
+            pauseSession("「系统拦截」关着")
             return false
         }
         if (Store.singleUseMin(this) <= 0) {
@@ -1270,8 +1386,9 @@ class GuardAccessibilityService : AccessibilityService() {
      * 2026-09-21 真机日志里孩子点开了设置、浏览器、权限控制器各一次，每条后面都紧跟
      * 「拦截 …→ 回到桌面」，应用是真的被打开过。盖上之后那半秒里点哪儿都没反应。
      *
-     * 颜色取得跟桌面背景一样是浅色：三星 One UI 的任务列表本来也是浅底，孩子看到的是
-     * 「那一屏闪了一下、什么都没发生」，不是一块突兀的黑屏。
+     * 颜色是纯黑（[TASK_BLOCKER_COLOR]）：2026-09-23 owner 定的，原来那版取浅灰
+     * （`0xFFF1F2F6`，理由是「跟三星任务列表的浅底一样，不刺眼」），他看到的是一块
+     * 白挡板，报的也是这个。
      *
      * 它只是**挡住手**，不参与任何判定：不推进窗口链（[isOwnOverlay] 会把自己的窗口事件跳掉）、
      * 不影响 [MainActivity.onScreen]、也不挡全局动作（返回键是系统直接执行的，不走窗口焦点）。
@@ -1377,7 +1494,7 @@ class GuardAccessibilityService : AccessibilityService() {
          * 盯那一屏的时间预算，见 [taskFollowUp]。**正常路径下根本轮不到它**：那一屏一走
          * 挡板立刻就收了，实测真机/模拟器都在 1 秒以内。这个上限是给「我们的簿记过期了」
          * （系统不再发窗口事件，我们怎么都看不出它走没走）兜底的——那时候只能先收挡板，
-         * 否则等于把孩子一直困在灰屏上。
+         * 否则等于把孩子一直困在挡板上。
          *
          * **它和旧版的区别是「谁说了算」**：旧版是 `postDelayed(收挡板, 2500ms)`，时间一到
          * 无条件收掉，哪怕那一屏还好端端盖在屏幕上（2026-09-22 真机报告就是这么把任务列表
@@ -1385,8 +1502,11 @@ class GuardAccessibilityService : AccessibilityService() {
          */
         private const val TASK_BLOCKER_MAX_MS = 8_000L
 
-        /** 挡板颜色。桌面是浅色 Material 3，三星任务列表也是浅底，用浅灰比黑屏不刺眼 */
-        private const val TASK_BLOCKER_COLOR = 0xFFF1F2F6.toInt()
+        /**
+         * 挡板颜色：**纯黑**。原来那版是浅灰 `0xFFF1F2F6`（想着跟三星任务列表的浅底一致），
+         * 2026-09-23 owner 报「仍会出现白色挡板……建议把白色挡板改为黑色」，改成黑
+         */
+        private const val TASK_BLOCKER_COLOR = 0xFF000000.toInt()
 
         /** 屏幕刚亮/刚灭之后多久内，别家桌面露头的窗口不当任务屏，见 [screenJustFlipped] */
         private const val SCREEN_FLIP_MS = 2_000L
@@ -1466,6 +1586,8 @@ class GuardAccessibilityService : AccessibilityService() {
                 // 「盯住那一屏」那一轮也跟着结束（那一屏要是又冒出来，会新起一轮）
                 it.stopTaskFollowUp("桌面已经回到最前面")
                 it.pauseSession("回到桌面")
+                // 孩子回到桌面了：上一次「白名单应用点开的那个应用」到此为止（见 childLaunchReason）
+                it.launchedFromWhitelist = null
             }
         }
 
@@ -1635,6 +1757,22 @@ class GuardAccessibilityService : AccessibilityService() {
             return list.joinToString("、") + "\n"
         }
 
+        /**
+         * 自检报告里那一小节：「允许应用跳转」开关与此刻正被放行的那个应用。
+         * 「在文件管理器里点 apk 为什么被弹回桌面 / 怎么又不弹了」的答案就在这两行。
+         */
+        fun childLaunchReport(ctx: Context): String {
+            val on = Store.allowChildLaunch(ctx)
+            val s = instance
+            val last = when {
+                s == null -> "（无障碍服务没在运行，这段拿不到）"
+                s.launchedFromWhitelist == null -> "（此刻没有；孩子回到桌面或回到白名单应用后就会清掉）"
+                else -> "${s.launchedFromWhitelist}（由白名单应用 ${s.launchedFromPkg ?: "?"} 点开）"
+            }
+            return "开关：${if (on) "开——白名单应用点开的那个应用不弹回桌面（只认一跳）" else "关——照旧弹回桌面"}\n" +
+                "此刻放行中的跳转：$last\n"
+        }
+
         /** 自检报告里那一小节 */
         fun sessionReport(ctx: Context): String {
             val limit = Store.singleUseMin(ctx)
@@ -1647,9 +1785,9 @@ class GuardAccessibilityService : AccessibilityService() {
                 sb.appendLine("屏幕顶部剩余时间小字：不会出现（它由无障碍服务显示）")
                 return sb.toString()
             }
-            if (!Store.interceptionOn(ctx)) {
-                sb.appendLine("当前会话：（不会计时——「启动拦截」总闸关着，整机不设防）")
-                sb.appendLine("  → 要拦就在「家长设置 → 拦截」里打开总闸，或开一次「测试拦截」")
+            if (!Store.sysInterceptOn(ctx)) {
+                sb.appendLine("当前会话：（不会计时——「系统拦截」关着，超时的乘法题不弹）")
+                sb.appendLine("  → 要限时就在「家长设置 → 拦截」里打开「系统拦截」，或开一次「测试拦截」")
                 sb.appendLine("屏幕顶部剩余时间小字：不会出现（没有会话就没有这行小字）")
                 return sb.toString()
             }

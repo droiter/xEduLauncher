@@ -36,8 +36,8 @@ void _mock(
   bool chOnHome = true,
   /// 家长设成「桌面不给图标」的应用
   List<String> hideIcon = const <String>[],
-  /// 拦截总闸（含「测试拦截」）此刻生不生效，界面每次要弹挑战前都会现问一次
-  bool interceptionOn = true,
+  /// 「系统拦截」（含「测试拦截」）此刻生不生效，界面每次要弹挑战前都会现问一次
+  bool sysInterceptOn = true,
   Future<void>? configGate,
   AccessibilityStatus accessibility = const AccessibilityStatus(
     enabled: true,
@@ -64,8 +64,8 @@ void _mock(
             return icons;
           case 'accessibilityStatus':
             return {'enabled': accessibility.enabled, 'running': accessibility.running};
-          case 'interceptionOn':
-            return interceptionOn;
+          case 'sysInterceptOn':
+            return sysInterceptOn;
           case 'returnToLastApp':
             return true;
         }
@@ -317,20 +317,20 @@ void main() {
     expect(calls, isNot(contains('returnToLastApp')));
   });
 
-  testWidgets('「启动拦截」总闸关着：按 Home 回来不弹挑战框，也不送回应用', (tester) async {
+  testWidgets('「系统拦截」关着：按 Home 回来不弹挑战框，也不送回应用', (tester) async {
     final calls = <String>[];
-    _mock('com.guard.off', const {}, calls: calls, interceptionOn: false);
+    _mock('com.guard.off', const {}, calls: calls, sysInterceptOn: false);
     await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
     await tester.pumpAndSettle();
 
     await _pressHome(tester);
-    expect(find.byType(Dialog), findsNothing, reason: '整机不设防时什么都不该弹');
+    expect(find.byType(Dialog), findsNothing, reason: '系统拦截关着时什么都不该弹');
     expect(calls, isNot(contains('returnToLastApp')));
   });
 
-  testWidgets('「启动拦截」总闸关着：点白名单应用直接打开，不弹挑战', (tester) async {
+  testWidgets('「系统拦截」关着：点白名单应用直接打开，不弹挑战', (tester) async {
     final calls = <String>[];
-    _mock('com.launch.off', const {}, calls: calls, interceptionOn: false);
+    _mock('com.launch.off', const {}, calls: calls, sysInterceptOn: false);
     await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
     await tester.pumpAndSettle();
 
@@ -352,5 +352,38 @@ void main() {
     await tester.tap(find.text('确定'));
     await tester.pumpAndSettle();
     expect(calls, contains('returnToLastApp'));
+  });
+
+  testWidgets('家长设置压在上面时按 Home：退掉页面，露出桌面', (tester) async {
+    _mock('com.home.page', const {});
+    final nav = GlobalKey<NavigatorState>();
+    await tester.pumpWidget(MaterialApp(navigatorKey: nav, home: const HomeScreen()));
+    await tester.pumpAndSettle();
+    nav.currentState!.push(
+      MaterialPageRoute<void>(builder: (_) => const Scaffold(body: Text('压在桌面上的页面'))),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('压在桌面上的页面'), findsOneWidget);
+
+    // 桌面这个 Activity 一直没离开前台，系统不会重新走生命周期，只有原生那一下 Home intent 看得见
+    Native.homePressed.value++;
+    await tester.pumpAndSettle();
+
+    expect(find.text('压在桌面上的页面'), findsNothing, reason: '按 Home 就该回到桌面，页面不能一直压着');
+    expect(find.text('儿童桌面'), findsOneWidget);
+  });
+
+  testWidgets('挑战框开着时按 Home：不退页面，框留着', (tester) async {
+    _mock('com.home.keep', const {});
+    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+    await tester.pumpAndSettle();
+
+    await _pressHome(tester);
+    expect(find.textContaining('×'), findsOneWidget);
+
+    Native.homePressed.value++;
+    await tester.pumpAndSettle();
+
+    expect(find.byType(Dialog), findsOneWidget, reason: '那一按正是孩子想跳出挑战框，退了等于放他走');
   });
 }

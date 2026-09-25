@@ -29,6 +29,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     Native.homeKey.addListener(_onHomeKey);
+    Native.homePressed.addListener(_onHomePressed);
     Native.backEscape.addListener(_onBackEscape);
     // 无障碍连上/断开时原生侧会主动推过来，顶部那行状态当场跟着变
     Native.accessibility.addListener(_onAccessibilityChanged);
@@ -54,6 +55,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     Native.homeKey.removeListener(_onHomeKey);
+    Native.homePressed.removeListener(_onHomePressed);
     Native.backEscape.removeListener(_onBackEscape);
     Native.accessibility.removeListener(_onAccessibilityChanged);
     WidgetsBinding.instance.removeObserver(this);
@@ -69,6 +71,28 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   /// 无障碍实况变了（原生侧推的，或某次刷新查到的），顶部那行跟着重画
   void _onAccessibilityChanged() {
     if (mounted) setState(() {});
+  }
+
+  /// 按 Home 键、而桌面本来就摆在自己面前：压在桌面上的页面（家长设置、选应用）退光，露出桌面。
+  /// 桌面这个 Activity 一直没离开前台，系统不会重新走一遍生命周期，只有原生侧那一下 Home intent
+  /// 看得见（见 MainActivity.onNewIntent）——所以退页面这件事得由它通知过来。
+  ///
+  /// 挑战框开着时不退：那时按 Home 的正是想跳出挑战框的孩子，退了等于放他走。
+  Future<void> _onHomePressed() async {
+    if (_challenging) {
+      Native.log('收到「按 Home 键」，但挑战框还开着，不退页面');
+      return;
+    }
+    if (!mounted) return;
+    final nav = Navigator.of(context);
+    if (!nav.canPop()) return;
+    Native.log('按 Home 键：退掉压在桌面上的页面，回到桌面');
+    // 用 maybePop 逐个退，不用 popUntil：栈上还压着 canPop:false 的页面时 popUntil 会原地打转
+    // （它 pop 不动就再来一次），maybePop 会老实返回 false 停手
+    while (nav.canPop()) {
+      if (!await nav.maybePop()) return;
+      if (!mounted) return;
+    }
   }
 
   /// 原生侧只在「孩子从别的应用逃回桌面」时通知这里（守护自己弹回桌面的那次不通知），
@@ -97,11 +121,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       Native.log('收到「$title」通知，配置仍取不回来，只能放过这一下');
       return;
     }
-    // 「启动拦截」总闸关着（家长自己用平板，或者「测试拦截」到点了）就不弹。
+    // 「系统拦截」关着（家长自己用平板，或者「测试拦截」到点了）就不弹。
     // 原生侧判定时也会挡一道，这里再问一次是为了掐准「测试拦截」到点的那一刻：
     // 通知发出来时还在测试里，等它到 Dart 这边可能刚好过期
-    if (!await Native.interceptionOn()) {
-      Native.log('收到「$title」通知，但「启动拦截」总闸关着（也没在测试拦截中），直接进桌面');
+    if (!await Native.sysInterceptOn()) {
+      Native.log('收到「$title」通知，但「系统拦截」关着（也没在测试拦截中），直接进桌面');
       return;
     }
     if (!cfg.chOnHome) {
@@ -153,8 +177,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final cfg = _cfg!;
     Native.log('点了磁贴「${app.label}」（${app.package}）');
     // 家长在「应用白名单」里把这个应用设成免挑战时，直接打开；
-    // 「启动拦截」总闸关着（也没在测试）时同样一个题都不弹，点开就进
-    if (await Native.interceptionOn() &&
+    // 「系统拦截」关着（也没在测试）时同样一个题都不弹，点开就进
+    if (await Native.sysInterceptOn() &&
         cfg.needsChallenge(app.package) &&
         !await _runChallenge('准备打开「${app.label}」')) {
       return;
@@ -269,9 +293,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
     return _BlinkingWarning(
       text: acc.enabled
-          ? '⚠ 无障碍已开启，但服务没在运行：限时、前台守护、回到桌面挑战都不会生效\n'
+          ? '⚠ 无障碍已开启，但服务没在运行：限时、不拦非白名单应用、回到桌面挑战都不会生效\n'
                 '请到「家长设置 → 防绕过 → 无障碍权限」里关掉再打开一次'
-          : '⚠ 无障碍权限未开启：限时、前台守护、回到桌面挑战都不会生效\n'
+          : '⚠ 无障碍权限未开启：限时、不拦非白名单应用、回到桌面挑战都不会生效\n'
                 '请到「家长设置 → 防绕过 → 无障碍权限」里打开',
     );
   }

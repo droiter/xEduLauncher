@@ -71,7 +71,7 @@ class AccessibilityStatus {
         running: m['running'] as bool? ?? false,
       );
 
-  /// 管控真的在生效吗——限时、前台守护、任务键、回到桌面挑战全靠这个权限
+  /// 管控真的在生效吗——限时、拦非白名单应用、任务键、回到桌面挑战全靠这个权限
   bool get ok => enabled && running;
 }
 
@@ -84,6 +84,11 @@ class Native {
 
   /// 按 Home 键回到桌面时自增，UI 监听它来弹挑战框
   static final ValueNotifier<int> homeKey = ValueNotifier<int>(0);
+
+  /// 「按 Home 键、而桌面本来就摆在自己面前」时自增：压在桌面上的页面（家长设置、选应用）
+  /// 要全部退掉，露出桌面。和 [homeKey] 分开：那一个专指「孩子从应用里逃回桌面」，
+  /// 要弹挑战框，这一下绝不能顺手把框退掉。
+  static final ValueNotifier<int> homePressed = ValueNotifier<int>(0);
 
   /// 「从应用里按返回键退出、回到了桌面」时自增，UI 监听它来弹挑战框。
   /// 和 [homeKey] 分开是因为横幅上要写清楚孩子是怎么出来的——这一次系统连 intent 都不发，
@@ -106,6 +111,8 @@ class Native {
       switch (call.method) {
         case 'onHomeKey':
           homeKey.value++;
+        case 'onHomePressed':
+          homePressed.value++;
         case 'onBackEscape':
           backEscape.value++;
         case 'onHomeResult':
@@ -124,12 +131,12 @@ class Native {
   static Future<LauncherConfig> config() async =>
       LauncherConfig.fromMap(await _ch.invokeMethod('config') ?? {});
 
-  /// 拦截此刻生不生效（总闸开着，或在「测试拦截」的几分钟里）——**现问原生侧**，
+  /// 「系统拦截」此刻生不生效（开关开着，或在「测试拦截」的几分钟里）——**现问原生侧**，
   /// 不用配置快照里那个值：快照可能是几分钟前取的，而「测试拦截」到点前后就差这一下。
   /// 查不到时返回 false：宁可这一次不拦，也别在家长已经关掉之后还弹一道题
-  static Future<bool> interceptionOn() async {
+  static Future<bool> sysInterceptOn() async {
     try {
-      return await _ch.invokeMethod<bool>('interceptionOn') ?? false;
+      return await _ch.invokeMethod<bool>('sysInterceptOn') ?? false;
     } catch (_) {
       return false;
     }
@@ -217,7 +224,7 @@ class Native {
 
   static Future<void> openSystemSettings() => _ch.invokeMethod('openSystemSettings');
 
-  /// 跳到系统「无障碍」页，让家长给前台守护授权
+  /// 跳到系统「无障碍」页，让家长给「不让非白名单应用启动」和限时授权
   static Future<void> openAccessibilitySettings() =>
       _ch.invokeMethod('openAccessibilitySettings');
   static Future<void> requestOverlay() => _ch.invokeMethod('requestOverlay');

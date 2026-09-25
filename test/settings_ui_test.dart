@@ -35,6 +35,7 @@ Map<String, Object?> _config({
   'guardEnabled': false,
   'frontGuard': false,
   'launchGuard': false,
+  'allowChildLaunch': false,
   'testGuardLeftSec': 0,
   'accessibilityOn': false,
   'settingsFreeMin': 10,
@@ -42,9 +43,15 @@ Map<String, Object?> _config({
   'fileServerUrl': '',
 };
 
-void _mock(Map<String, Object?> Function() config) {
+void _mock(Map<String, Object?> Function() config, {List<String>? calls}) {
   TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
       .setMockMethodCallHandler(_channel, (call) async {
+        // 打开应用这类要核对参数的调用连参数一起记下来
+        calls?.add(
+          call.method == 'launchApp'
+              ? '${call.method}:${call.arguments}'
+              : call.method,
+        );
         switch (call.method) {
           case 'config':
             return config();
@@ -62,6 +69,8 @@ void _mock(Map<String, Object?> Function() config) {
             return config();
           case 'setTestGuard':
             return config();
+          case 'launchApp':
+            return true;
         }
         return null;
       });
@@ -83,32 +92,62 @@ void main() {
 
     expect(find.text('启动应用时挑战（总开关）'), findsOneWidget);
     expect(find.textContaining('已允许 2 个应用'), findsOneWidget);
-    expect(find.text('前台守护（防任务键切换）'), findsOneWidget);
+    expect(find.text('不让非白名单应用启动'), findsOneWidget);
     expect(find.textContaining('都要靠它知道前台是哪个应用'), findsOneWidget);
     expect(find.text('修改家长控制密码'), findsOneWidget);
     expect(find.text('修改系统设置密码'), findsOneWidget);
     expect(find.textContaining('未单独设置，目前沿用家长控制密码'), findsOneWidget);
   });
 
-  testWidgets('拦截总闸缺省关着，说明里写清「关掉就整机不设防」', (tester) async {
+  testWidgets('拦截是两个互相独立的开关，缺省都关着', (tester) async {
     _mock(_config);
     useTallScreen(tester);
     await tester.pumpWidget(const MaterialApp(home: SettingsScreen()));
     await tester.pumpAndSettle();
 
-    expect(find.text('启动拦截（总闸）'), findsOneWidget);
+    expect(find.text('系统拦截'), findsOneWidget);
+    expect(find.text('不让非白名单应用启动'), findsOneWidget);
     expect(find.text('测试拦截（3 分钟）'), findsOneWidget);
-    expect(find.textContaining('整机不设防'), findsWidgets);
-    expect(find.textContaining('缺省是关的'), findsOneWidget);
+    // 两个开关各自的说明里都要写明缺省是关的
+    expect(find.textContaining('缺省是关的'), findsNWidgets(2));
   });
 
-  testWidgets('前台守护开着但总闸关着时，说明里点出「等于没拦」', (tester) async {
+  testWidgets('只开「不让非白名单应用启动」时不说「等于没拦」（两开关独立）', (tester) async {
     _mock(() => {..._config(), 'frontGuard': true});
     useTallScreen(tester);
     await tester.pumpWidget(const MaterialApp(home: SettingsScreen()));
     await tester.pumpAndSettle();
 
-    expect(find.textContaining('等于没拦'), findsOneWidget);
+    // 系统拦截关着，但它不影响这一条：这里只提示缺无障碍，而不是「等于没拦」
+    expect(find.textContaining('还没启用本应用，现在拦不住'), findsOneWidget);
+    expect(find.textContaining('等于没拦'), findsNothing);
+  });
+
+  testWidgets('「允许应用跳转」缺省关着，打开后写明「只认一跳」', (tester) async {
+    var on = false;
+    _mock(() => {
+      ..._config(),
+      'launchGuard': true,
+      'frontGuard': true,
+      'allowChildLaunch': on,
+    });
+    useTallScreen(tester);
+    await tester.pumpWidget(const MaterialApp(home: SettingsScreen()));
+    await tester.pumpAndSettle();
+
+    const title = '允许应用跳转（白名单应用里点开的其它应用）';
+    expect(find.text(title), findsOneWidget);
+    // 缺省关着：说明里要讲清「照旧弹回桌面」，以及家长自己装 apk 时怎么绕
+    expect(find.textContaining('照旧被弹回桌面'), findsOneWidget);
+    expect(find.textContaining('放行时长'), findsWidgets);
+
+    on = true;
+    await tester.tap(find.widgetWithText(SwitchListTile, title));
+    await tester.pumpAndSettle();
+
+    // 两个开关都开着时：写明已生效、只认一跳、以及那一跳不计入单次时长
+    expect(find.textContaining('只认一跳'), findsOneWidget);
+    expect(find.textContaining('不计入单次时长'), findsOneWidget);
   });
 
   testWidgets('开「测试拦截」后倒计时往下走，到点自己关掉', (tester) async {
@@ -204,30 +243,33 @@ void main() {
     expect(find.textContaining('孩子拿不到这个密码'), findsOneWidget);
   });
 
-  testWidgets('白名单里已勾选的应用可以逐个设「不弹挑战」/「可随意退到桌面」/「桌面不给图标」', (tester) async {
+  testWidgets('白名单里已勾选的应用可以逐个设「不弹挑战」/「可随意退到桌面」/「桌面不给图标」，改一下就生效', (tester) async {
     _mock(_config);
     AppPickerResult? result;
     await tester.pumpWidget(MaterialApp(
       home: Builder(
         builder: (ctx) => ElevatedButton(
-          onPressed: () async {
-            result = await Navigator.of(ctx).push<AppPickerResult>(
-              MaterialPageRoute(
-                builder: (_) => const AppPickerScreen(
-                  selected: ['com.b'],
-                  noChallenge: [],
-                  freeExit: [],
-                  hideIcon: [],
-                ),
+          onPressed: () => Navigator.of(ctx).push(
+            MaterialPageRoute(
+              builder: (_) => AppPickerScreen(
+                selected: const ['com.b'],
+                noChallenge: const [],
+                freeExit: const [],
+                hideIcon: const [],
+                onChanged: (r) => result = r,
               ),
-            );
-          },
+            ),
+          ),
           child: const Text('打开'),
         ),
       ),
     ));
     await tester.tap(find.text('打开'));
     await tester.pumpAndSettle();
+
+    // 没有保存按钮：还没动过任何开关，一次都还没回调
+    expect(find.text('保存'), findsNothing);
+    expect(result, isNull);
 
     // 默认三个开关都是开的（打开要挑战、退回桌面要挑战、桌面显示图标），三份例外名单都是空的
     expect(find.text('打开要挑战 · 退回桌面要挑战 · 桌面显示图标'), findsOneWidget);
@@ -236,10 +278,14 @@ void main() {
       findsOneWidget,
     );
 
-    // 第一个开关管「进入」，第二个管「退出」，第三个管「显示」
+    // 第一个开关管「进入」，第二个管「退出」，第三个管「显示」。
+    // 每拨一下就立刻回调一次，四个清单一起给
     await tester.tap(find.byType(Switch).first);
     await tester.pumpAndSettle();
     expect(find.text('打开免挑战 · 退回桌面要挑战 · 桌面显示图标'), findsOneWidget);
+    expect(result!.allowed, ['com.b']);
+    expect(result!.noChallenge, ['com.b']);
+    expect(result!.freeExit, isEmpty);
 
     await tester.tap(find.byType(Switch).at(1));
     await tester.pumpAndSettle();
@@ -248,6 +294,7 @@ void main() {
       find.textContaining('已选 1 个应用：1 个打开免挑战、1 个可随意退到桌面、0 个不在桌面显示'),
       findsOneWidget,
     );
+    expect(result!.freeExit, ['com.b']);
 
     // 关掉「显示」＝ 这个应用不进孩子的桌面，但仍是白名单应用
     await tester.tap(find.byType(Switch).at(2));
@@ -257,33 +304,26 @@ void main() {
       find.textContaining('已选 1 个应用：1 个打开免挑战、1 个可随意退到桌面、1 个不在桌面显示'),
       findsOneWidget,
     );
-
-    await tester.tap(find.text('保存'));
-    await tester.pumpAndSettle();
-    expect(result!.allowed, ['com.b']);
-    expect(result!.noChallenge, ['com.b']);
-    expect(result!.freeExit, ['com.b']);
     expect(result!.hideIcon, ['com.b']);
   });
 
-  testWidgets('取消勾选时「可随意退到桌面」「桌面不给图标」的配置跟着一起清掉', (tester) async {
+  testWidgets('取消勾选时「可随意退到桌面」「桌面不给图标」的配置跟着一起清掉，不用保存', (tester) async {
     _mock(_config);
     AppPickerResult? result;
     await tester.pumpWidget(MaterialApp(
       home: Builder(
         builder: (ctx) => ElevatedButton(
-          onPressed: () async {
-            result = await Navigator.of(ctx).push<AppPickerResult>(
-              MaterialPageRoute(
-                builder: (_) => const AppPickerScreen(
-                  selected: ['com.b'],
-                  noChallenge: ['com.b'],
-                  freeExit: ['com.b'],
-                  hideIcon: ['com.b'],
-                ),
+          onPressed: () => Navigator.of(ctx).push(
+            MaterialPageRoute(
+              builder: (_) => AppPickerScreen(
+                selected: const ['com.b'],
+                noChallenge: const ['com.b'],
+                freeExit: const ['com.b'],
+                hideIcon: const ['com.b'],
+                onChanged: (r) => result = r,
               ),
-            );
-          },
+            ),
+          ),
           child: const Text('打开'),
         ),
       ),
@@ -291,14 +331,57 @@ void main() {
     await tester.tap(find.text('打开'));
     await tester.pumpAndSettle();
 
-    // 点整行 = 取消勾选这个应用
+    // 点整行 = 取消勾选这个应用：一取消就回一次，三份例外名单跟着清空
     await tester.tap(find.text('数学练习'));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('保存'));
     await tester.pumpAndSettle();
     expect(result!.allowed, isEmpty);
     expect(result!.noChallenge, isEmpty);
     expect(result!.freeExit, isEmpty);
     expect(result!.hideIcon, isEmpty);
+  });
+
+  testWidgets('窄屏（360dp）一行要同时放下勾选框、图标、三个开关和「打开」按钮，不溢出', (tester) async {
+    _mock(_config);
+    tester.view.physicalSize = const Size(360, 800);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(MaterialApp(
+      home: AppPickerScreen(
+        selected: const ['com.a', 'com.b'],
+        noChallenge: const ['com.a'],
+        freeExit: const [],
+        hideIcon: const [],
+        onChanged: (_) {},
+      ),
+    ));
+    await tester.pumpAndSettle();
+
+    // 溢出的话渲染时会抛「A RenderFlex overflowed」，这里就接住了
+    expect(tester.takeException(), isNull);
+    expect(find.text('计算器'), findsOneWidget);
+    expect(find.text('数学练习'), findsOneWidget);
+  });
+
+  testWidgets('白名单页每行的「打开」按钮直接拉起那个应用，不弹挑战', (tester) async {
+    final calls = <String>[];
+    _mock(_config, calls: calls);
+    await tester.pumpWidget(MaterialApp(
+      home: AppPickerScreen(
+        selected: const [],
+        noChallenge: const [],
+        freeExit: const [],
+        hideIcon: const [],
+        onChanged: (_) {},
+      ),
+    ));
+    await tester.pumpAndSettle();
+
+    // 没勾选的行也有这个按钮
+    expect(find.byTooltip('直接打开「计算器」'), findsOneWidget);
+    await tester.tap(find.byTooltip('直接打开「计算器」'));
+    await tester.pumpAndSettle();
+
+    expect(calls, contains('launchApp:com.a'));
+    expect(find.byType(Dialog), findsNothing);
   });
 }

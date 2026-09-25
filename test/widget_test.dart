@@ -59,6 +59,14 @@ void main() {
     expect(LauncherConfig.fromMap({}).hideIcon, isEmpty);
   });
 
+  test('「允许应用跳转」缺省关着', () {
+    expect(LauncherConfig.fromMap({}).allowChildLaunch, isFalse);
+    expect(
+      LauncherConfig.fromMap({'allowChildLaunch': true}).allowChildLaunch,
+      isTrue,
+    );
+  });
+
   test('挑战总开关关掉时所有应用都直接打开', () {
     final cfg = LauncherConfig(chOnLaunch: false);
     expect(cfg.needsChallenge('com.a'), isFalse);

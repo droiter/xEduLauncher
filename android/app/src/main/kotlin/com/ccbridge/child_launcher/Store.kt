@@ -28,6 +28,7 @@ object Store {
     private const val K_HIDE_ICON = "hide_icon_packages"
     private const val K_FRONT_GUARD = "front_guard_enabled"
     private const val K_LAUNCH_GUARD = "launch_guard_enabled"
+    private const val K_ALLOW_CHILD_LAUNCH = "allow_child_launch"
     private const val K_TEST_GUARD_UNTIL = "test_guard_until"
     private const val K_PARENT_FREE_UNTIL = "parent_free_until"
     private const val K_SETTINGS_FREE_MIN = "settings_free_minutes"
@@ -141,15 +142,42 @@ object Store {
     fun hideIcon(ctx: Context): Set<String> =
         p(ctx).getStringSet(K_HIDE_ICON, emptySet()) ?: emptySet()
 
+    /**
+     * 「不让非白名单应用启动」。**缺省关着**。
+     *
+     * 打开后，非白名单应用一露头就被送回儿童桌面——从通知点开、从最近任务切回一个后台还在跑的
+     * 应用、从别处点进来，都拦。要生效还得：无障碍服务在跑、家长不在放行期、本应用是系统默认桌面
+     * （见 [GuardAccessibilityService.guardOffReason]）。
+     *
+     * **和 [launchGuard]（系统拦截）互相独立**（2026-09-24 owner 定的）：这一条只管「不让它启动」，
+     * 任务列表、超时/点开/退出那些弹框都归 [launchGuard] 管，各管各的。
+     */
     fun frontGuard(ctx: Context) = bool(ctx, K_FRONT_GUARD, false)
+
     fun settingsFreeMin(ctx: Context) = num(ctx, K_SETTINGS_FREE_MIN, 10)
 
-    // ---------- 拦截总闸 ----------
+    /**
+     * 「允许应用跳转」。**缺省关着**（＝照旧拦：孩子点开的非白名单应用一律弹回桌面）。
+     *
+     * 打开后，**从白名单应用里点开的另一个应用**不再被弹回桌面——文件管理器里点 apk 弹出的
+     * 安装界面、应用里点链接打开的浏览器、分享出去的目标应用，都算。只认一跳：从那个应用
+     * 再往外点开的东西照旧拦（它自己不是白名单应用）。判定在
+     * [GuardAccessibilityService.childLaunchReason]。
+     *
+     * **Why:** 安装 apk 是家长自己的活儿，也是孩子的一条通用出路——所以既不能一直拦着
+     * （家长装个应用得先去系统设置里蹭放行期），也不能一直放行（孩子从文件管理器能点到任何东西）。
+     * 交给家长自己决定。
+     */
+    fun allowChildLaunch(ctx: Context) = bool(ctx, K_ALLOW_CHILD_LAUNCH, false)
+
+    // ---------- 拦截的两个开关 ----------
 
     /**
-     * 「启动拦截」总闸。**缺省关着**：关着时整机不设防——非白名单应用不弹回桌面、
-     * 点开应用/从应用回桌面都不弹挑战、到达时长与次数的密码页也不拉起。
-     * 家长自己用平板时把它关掉最省事，[interceptionOn] 是所有拦截点唯一的判据。
+     * 「系统拦截」。**缺省关着**：关着时点开应用、从应用回桌面、用满时长/次数（超时弹框）
+     * 这些一个都不弹，按任务键也能看到最近任务；桌面只摆白名单应用这件事不归它管（那是桌面自己
+     * 的取数，见 `home_screen.dart`）。
+     *
+     * 家长自己用平板时把它关掉最省事。[sysInterceptOn] 是所有「系统拦截」类判据的唯一出处。
      */
     fun launchGuard(ctx: Context) = bool(ctx, K_LAUNCH_GUARD, false)
 
@@ -165,10 +193,20 @@ object Store {
     fun testGuardActive(ctx: Context) = testGuardLeftSec(ctx) > 0
 
     /**
-     * 拦截此刻生不生效：家长把总闸打开了，**或者**正处在「测试拦截」的几分钟里。
-     * 测试是给家长验证用的——总闸关着也能临时拦一段，到点自动恢复成不设防。
+     * 「系统拦截」此刻生不生效：家长把那个开关打开了，**或者**正处在「测试拦截」的几分钟里。
+     * 管的是弹框与任务列表这一类（见 [launchGuard]）。
      */
-    fun interceptionOn(ctx: Context) = launchGuard(ctx) || testGuardActive(ctx)
+    fun sysInterceptOn(ctx: Context) = launchGuard(ctx) || testGuardActive(ctx)
+
+    /**
+     * 「不让非白名单应用启动」此刻生不生效：开关打开了，**或者**正处在「测试拦截」的几分钟里。
+     * 管的是「非白名单应用一露头就送回桌面」这一条（见 [frontGuard]）。
+     *
+     * 两个开关**互相独立**：只开这一个，非白名单应用照样弹回桌面，但一个挑战框都不弹、
+     * 任务列表也不挡；只开 [sysInterceptOn] 那个，弹框和任务列表照管，但非白名单应用打开就打开了。
+     * 「测试拦截」是给家长验证用的，两条一起临时打开，到点自动恢复成各自开关本来的样子。
+     */
+    fun appBlockOn(ctx: Context) = frontGuard(ctx) || testGuardActive(ctx)
 
     /** 开一次「测试拦截」；minutes <= 0 表示立刻关掉 */
     fun setTestGuard(ctx: Context, minutes: Int) {
@@ -301,8 +339,8 @@ object Store {
 
     /** 返回 "time" / "count" / null */
     fun gateReason(ctx: Context): String? {
-        // 总闸关着 = 整机不设防，使用限制也不拦（家长自己用时最省事）
-        if (!interceptionOn(ctx)) return null
+        // 「系统拦截」关着 = 超时这一类弹框都不弹（家长自己用时最省事）
+        if (!sysInterceptOn(ctx)) return null
         rollDate(ctx)
         val limit = dailyLimitMin(ctx) * 60
         if (limit > 0 && usedSeconds(ctx) >= limit + extraSeconds(ctx)) return "time"
@@ -313,10 +351,10 @@ object Store {
 
     fun showLock(ctx: Context, reason: String) {
         if (LockActivity.showing) return
-        // 唯一入口在这里，所以总闸也在这里把：不管谁调（守护服务、桌面 onResume、Dart 通道）
-        // 总闸关着就一个密码页都不弹
-        if (!interceptionOn(ctx)) {
-            Diag.log("gate", "命中限制 $reason，但「启动拦截」总闸关着，不弹密码页")
+        // 唯一入口在这里，所以开关也在这里把：不管谁调（守护服务、桌面 onResume、Dart 通道）
+        // 「系统拦截」关着就一个密码页都不弹
+        if (!sysInterceptOn(ctx)) {
+            Diag.log("gate", "命中限制 $reason，但「系统拦截」关着，不弹密码页")
             return
         }
         val i = Intent(ctx, LockActivity::class.java)
@@ -343,8 +381,8 @@ object Store {
     /** 单次使用时长到点：在孩子正用着的那个应用之上弹出乘法挑战页 */
     fun showSessionChallenge(ctx: Context, pkg: String) {
         if (SessionChallengeActivity.showing) return
-        if (!interceptionOn(ctx)) {
-            Diag.log("session", "$pkg 单次用满，但「启动拦截」总闸关着，不弹挑战页")
+        if (!sysInterceptOn(ctx)) {
+            Diag.log("session", "$pkg 单次用满，但「系统拦截」关着，不弹挑战页")
             return
         }
         val i = Intent(ctx, SessionChallengeActivity::class.java)
@@ -635,6 +673,7 @@ object Store {
             "guardEnabled" to guardEnabled(ctx),
             "frontGuard" to frontGuard(ctx),
             "launchGuard" to launchGuard(ctx),
+            "allowChildLaunch" to allowChildLaunch(ctx),
             "testGuardLeftSec" to testGuardLeftSec(ctx),
             "accessibilityOn" to accessibilityOn(ctx),
             "settingsFreeMin" to settingsFreeMin(ctx),
@@ -692,6 +731,7 @@ object Store {
         (m["guardEnabled"] as? Boolean)?.let { e.putBoolean(K_GUARD_ENABLED, it) }
         (m["frontGuard"] as? Boolean)?.let { e.putBoolean(K_FRONT_GUARD, it) }
         (m["launchGuard"] as? Boolean)?.let { e.putBoolean(K_LAUNCH_GUARD, it) }
+        (m["allowChildLaunch"] as? Boolean)?.let { e.putBoolean(K_ALLOW_CHILD_LAUNCH, it) }
         (m["settingsFreeMin"] as? Number)?.let { e.putInt(K_SETTINGS_FREE_MIN, it.toInt()) }
         (m["fileServerOn"] as? Boolean)?.let { e.putBoolean(K_FILE_SERVER, it) }
         e.apply()
