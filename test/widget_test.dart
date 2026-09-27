@@ -25,6 +25,21 @@ void main() {
     expect(cfg.remainingSeconds, isNull);
   });
 
+  test('复位停用时长缺省 2 小时；原生给了就照给的值走', () {
+    expect(LauncherConfig.fromMap({}).refillWaitMin, 120);
+    expect(LauncherConfig.fromMap({'refillWaitMin': 30}).refillWaitMin, 30);
+    // 0 = 不复位，不是「取缺省」
+    expect(LauncherConfig.fromMap({'refillWaitMin': 0}).refillWaitMin, 0);
+  });
+
+  test('单次剩余由原生现算：给了就解析出来，没给是 null', () {
+    expect(
+      LauncherConfig.fromMap({'sessionLeftSec': 480}).sessionLeftSeconds,
+      480,
+    );
+    expect(LauncherConfig.fromMap({}).sessionLeftSeconds, isNull);
+  });
+
   test('白名单里可以单独指定「打开时不弹挑战」的应用', () {
     final cfg = LauncherConfig.fromMap({
       'allowed': ['com.a', 'com.b'],

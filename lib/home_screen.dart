@@ -240,9 +240,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Widget _header(LauncherConfig cfg) {
     final parts = <String>[];
-    final remain = cfg.remainingSeconds;
-    if (remain != null) {
-      parts.add('今日剩余 ${(remain / 60).ceil()} 分钟');
+    // 「还剩多久」报的是**单次剩余和今日剩余里较小的那个**（2026-09-25 owner）。
+    // 只报今日剩余的话，桌面上写着「今日剩余 20 分钟」、孩子一进应用就先被单次乘法题拦住，
+    // 家长看到的就是两个对不上的数
+    final daily = cfg.remainingSeconds;
+    final session = cfg.sessionLeftSeconds;
+    if (session != null && (daily == null || session < daily)) {
+      parts.add('单次剩余 ${(session / 60).ceil()} 分钟');
+    } else if (daily != null) {
+      parts.add('今日剩余 ${(daily / 60).ceil()} 分钟');
     }
     if (cfg.openLimitOn) {
       parts.add('打开 ${cfg.openCount}/${cfg.openLimit} 次');
@@ -269,7 +275,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             Padding(
               padding: const EdgeInsets.only(top: 6),
               child: Text(
-                '⚠ 尚未设为默认桌面，Home 键不会回到这里',
+                '⚠ 尚未设为默认桌面：Home 键不会回到这里，拦截也整块不生效',
                 style: TextStyle(color: Colors.orange.shade800, fontSize: 13),
               ),
             ),

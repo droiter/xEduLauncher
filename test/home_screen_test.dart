@@ -16,6 +16,9 @@ Map<String, Object?> _config(
   bool coldStartHome = false,
   bool chOnHome = true,
   List<String> hideIcon = const <String>[],
+  int dailyLimitMin = 0,
+  int usedSeconds = 0,
+  int? sessionLeftSec,
 }) => {
   'challengeType': 'mul',
   'chOnLaunch': true,
@@ -23,9 +26,12 @@ Map<String, Object?> _config(
   'allowed': [pkg],
   'noChallenge': const <String>[],
   'hideIcon': hideIcon,
-  'dailyLimitMin': 0,
+  'dailyLimitMin': dailyLimitMin,
+  'usedSeconds': usedSeconds,
   'isDefaultLauncher': true,
   'coldStartHome': coldStartHome,
+  // 原生侧只在「看得出孩子在用哪个应用」时才给这个键
+  'sessionLeftSec': ?sessionLeftSec,
 };
 
 void _mock(
@@ -38,6 +44,10 @@ void _mock(
   List<String> hideIcon = const <String>[],
   /// 「系统拦截」（含「测试拦截」）此刻生不生效，界面每次要弹挑战前都会现问一次
   bool sysInterceptOn = true,
+  /// 今日上限（分钟）与已用秒数；[sessionLeftSec] 是「孩子刚用的那个应用单次还剩多少秒」
+  int dailyLimitMin = 0,
+  int usedSeconds = 0,
+  int? sessionLeftSec,
   Future<void>? configGate,
   AccessibilityStatus accessibility = const AccessibilityStatus(
     enabled: true,
@@ -55,6 +65,9 @@ void _mock(
               coldStartHome: coldStartHome,
               chOnHome: chOnHome,
               hideIcon: hideIcon,
+              dailyLimitMin: dailyLimitMin,
+              usedSeconds: usedSeconds,
+              sessionLeftSec: sessionLeftSec,
             );
           case 'listApps':
             return [
@@ -385,5 +398,44 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.byType(Dialog), findsOneWidget, reason: '那一按正是孩子想跳出挑战框，退了等于放他走');
+  });
+
+  testWidgets('桌面标题报「单次剩余」和「今日剩余」里较小的那个', (tester) async {
+    // 今日额度 60 分钟、已用 3500 秒 → 今日还剩 100 秒；单次只剩 30 秒 → 报单次
+    _mock(
+      'com.left.session',
+      const {},
+      dailyLimitMin: 60,
+      usedSeconds: 3500,
+      sessionLeftSec: 30,
+    );
+    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('单次剩余 1 分钟'), findsOneWidget);
+    expect(find.textContaining('今日剩余'), findsNothing, reason: '单次先到点就该报单次');
+  });
+
+  testWidgets('今日剩余更少时报今日，单次充裕时不误报', (tester) async {
+    _mock(
+      'com.left.daily',
+      const {},
+      dailyLimitMin: 10,
+      usedSeconds: 540,
+      sessionLeftSec: 600,
+    );
+    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('今日剩余 1 分钟'), findsOneWidget);
+    expect(find.textContaining('单次剩余'), findsNothing);
+  });
+
+  testWidgets('原生没给单次剩余（没设单次上限/看不出他在用哪个应用）时，照旧只报今日', (tester) async {
+    _mock('com.left.none', const {}, dailyLimitMin: 30, usedSeconds: 0);
+    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('今日剩余 30 分钟'), findsOneWidget);
   });
 }

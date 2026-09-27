@@ -38,6 +38,8 @@ object Store {
     private const val K_OPEN_LIMIT = "open_limit"
     private const val K_USED_SECONDS = "used_seconds"
     private const val K_EXTRA_SECONDS = "extra_seconds"
+    private const val K_REFILL_WAIT_MIN = "refill_wait_minutes"
+    private const val K_LAST_USED_AT = "last_used_at"
     private const val K_OPEN_COUNT = "open_count"
     private const val K_STAT_DATE = "stat_date"
     private const val K_LAST_RESUME = "last_resume"
@@ -62,6 +64,9 @@ object Store {
 
     /** 单次使用时长缺省值：家长不设也有 10 分钟 */
     const val DEFAULT_SINGLE_USE_MIN = 10
+
+    /** 今日额度用满后，要「连续停用」多久才自动复位（分钟）。缺省 2 小时（2026-09-25 owner 定的） */
+    const val DEFAULT_REFILL_WAIT_MIN = 120
 
     /** 距上次进入桌面超过该毫秒数，才把本次进入算作一次新的“打开” */
     private const val NEW_OPEN_GAP_MS = 120_000L
@@ -98,6 +103,7 @@ object Store {
                 .putInt(K_USED_SECONDS, 0)
                 .putInt(K_EXTRA_SECONDS, 0)
                 .putInt(K_OPEN_COUNT, 0)
+                .putLong(K_LAST_USED_AT, 0L)
             prefs.all.keys.filter { it.startsWith(K_SESSION_USED_PREFIX) }.forEach { e.remove(it) }
             e.apply()
         }
@@ -177,7 +183,8 @@ object Store {
      * 这些一个都不弹，按任务键也能看到最近任务；桌面只摆白名单应用这件事不归它管（那是桌面自己
      * 的取数，见 `home_screen.dart`）。
      *
-     * 家长自己用平板时把它关掉最省事。[sysInterceptOn] 是所有「系统拦截」类判据的唯一出处。
+     * 家长自己用平板时把它关掉最省事。[sysInterceptOn] 是所有「系统拦截」类判据的唯一出处
+     * ——它另外还要求本应用是系统默认桌面（见 [sysInterceptOffReason]）。
      */
     fun launchGuard(ctx: Context) = bool(ctx, K_LAUNCH_GUARD, false)
 
@@ -193,10 +200,30 @@ object Store {
     fun testGuardActive(ctx: Context) = testGuardLeftSec(ctx) > 0
 
     /**
-     * 「系统拦截」此刻生不生效：家长把那个开关打开了，**或者**正处在「测试拦截」的几分钟里。
-     * 管的是弹框与任务列表这一类（见 [launchGuard]）。
+     * 「系统拦截」此刻**没**在生效的原因；生效时返回 null。
+     *
+     * 加这一层是因为「不生效」有不止一个理由，而日志和自检报告里只写一句「没生效」家长查不出
+     * 是哪条挡的（[GuardAccessibilityService.guardOffReason] 当初就是为这个加的）。
      */
-    fun sysInterceptOn(ctx: Context) = launchGuard(ctx) || testGuardActive(ctx)
+    fun sysInterceptOffReason(ctx: Context): String? {
+        if (!launchGuard(ctx) && !testGuardActive(ctx)) return "「系统拦截」开关没打开（也没在测试拦截中）"
+        // **本应用不是系统默认桌面时，整块按「关着」算**（2026-09-26 owner 定的）：那时候按 Home
+        // 键回的不是这个桌面、孩子根本不在围墙里，密码页和挑战框却照样会盖到他（或者正在自己用
+        // 平板的家长）脸上。任务键那一屏更早以前单独问过同一件事（见
+        // [GuardAccessibilityService.taskKillOffReason]），现在一并收到这里问，三个入口一条判据。
+        // 只说「不弹」不够——计时也一并停（见 GuardAccessibilityService.startSession/tickSession），
+        // 免得这几天白攒进去，家长一设上默认桌面就发现「今日已用」已经满了。
+        // 开关本身那个值一个字不动：设成默认桌面后立刻恢复生效（[isDefaultLauncher] 那 30 秒缓冲
+        // 也照旧兜着判定翻车，不会一闪一闪）。
+        if (!isDefaultLauncher(ctx)) return "本应用不是系统默认桌面（系统拦截整块按关着算）"
+        return null
+    }
+
+    /**
+     * 「系统拦截」此刻生不生效：家长把那个开关打开了，**或者**正处在「测试拦截」的几分钟里，
+     * **并且**本应用是系统默认桌面。管的是弹框与任务列表这一类（见 [launchGuard]）。
+     */
+    fun sysInterceptOn(ctx: Context) = sysInterceptOffReason(ctx) == null
 
     /**
      * 「不让非白名单应用启动」此刻生不生效：开关打开了，**或者**正处在「测试拦截」的几分钟里。
@@ -261,10 +288,96 @@ object Store {
     fun extraSeconds(ctx: Context) = num(ctx, K_EXTRA_SECONDS, 0)
     fun openCount(ctx: Context) = num(ctx, K_OPEN_COUNT, 0)
 
+    /** 用满后要「连续停用」多久才复位（分钟）。0 = 不复位，只能等第二天或家长给宽限 */
+    fun refillWaitMin(ctx: Context) = num(ctx, K_REFILL_WAIT_MIN, DEFAULT_REFILL_WAIT_MIN)
+
+    fun lastUsedAt(ctx: Context) = p(ctx).getLong(K_LAST_USED_AT, 0L)
+
+    /**
+     * 计时的唯一落点。顺手把「最后一次用 pad 的时刻」记下来——复位判的是**连续停用**
+     * 时长，只要还在用（哪怕只是亮屏在桌面晃）就得重新计，见 [maybeRefill]。
+     */
     fun addUsedSeconds(ctx: Context, n: Int) {
         if (n <= 0) return
         val prefs = p(ctx)
-        prefs.edit().putInt(K_USED_SECONDS, prefs.getInt(K_USED_SECONDS, 0) + n).apply()
+        prefs.edit()
+            .putInt(K_USED_SECONDS, prefs.getInt(K_USED_SECONDS, 0) + n)
+            .putLong(K_LAST_USED_AT, SystemClock.elapsedRealtime())
+            .apply()
+    }
+
+    /** 今日额度此刻是不是已经用满（算式和 [gateReason] 里那条一字不差） */
+    fun dailyExhausted(ctx: Context): Boolean {
+        val limit = dailyLimitMin(ctx) * 60
+        return limit > 0 && usedSeconds(ctx) >= limit + extraSeconds(ctx)
+    }
+
+    /**
+     * 「连续停用」的起点。正常就是最后一次计时的那一刻；升级到这一版之前攒下的用量没有这个
+     * 时间戳（老版本不记），那就**从第一次观察到用满的这一刻开始算**——否则老数据会永远停在
+     * 「不知道从哪算起」而永不复位。写一次就稳住了，不是每次读都写。
+     */
+    private fun refillAnchor(ctx: Context): Long {
+        val now = SystemClock.elapsedRealtime()
+        val last = lastUsedAt(ctx)
+        // last > now 只可能是重启过：elapsedRealtime 一开机从 0 重新数。这根锚就作废、
+        // 从此刻重数，否则「等着等着他把 pad 重启了」会白搭上上次开机的整段时间
+        if (last in 1..now) return last
+        p(ctx).edit().putLong(K_LAST_USED_AT, now).apply()
+        return now
+    }
+
+    /** 距离复位还有多少秒；null = 这会儿谈不上复位（没设今日上限 / 没用满 / 复位关着） */
+    fun refillLeftSec(ctx: Context): Int? {
+        if (!dailyExhausted(ctx)) return null
+        val waitMs = refillWaitMin(ctx) * 60_000L
+        if (waitMs <= 0L) return null
+        val left = waitMs - (SystemClock.elapsedRealtime() - refillAnchor(ctx))
+        return (left / 1000L).coerceAtLeast(0L).toInt()
+    }
+
+    /**
+     * 用满之后连续停用够久了：今日用量和宽限累计一起清零，重新给满。
+     *
+     * **只在「已经用满」时才复位**。不这么卡的话，孩子玩 20 分钟、歇 2 小时、再玩 20 分钟……
+     * 这个「每日上限」就名存实亡了——owner 要的是「用满被锁住了，歇够 2 小时能再来一轮」
+     * （2026-09-25 定的语义），不是「每隔 2 小时白送一份额度」。
+     *
+     * @return 这一次真的复位了没有
+     */
+    fun maybeRefill(ctx: Context): Boolean {
+        if (!dailyExhausted(ctx)) return false
+        val waitMs = refillWaitMin(ctx) * 60_000L
+        if (waitMs <= 0L) return false
+        if (SystemClock.elapsedRealtime() - refillAnchor(ctx) < waitMs) return false
+        p(ctx).edit()
+            .putInt(K_USED_SECONDS, 0)
+            .putInt(K_EXTRA_SECONDS, 0)
+            .putLong(K_LAST_USED_AT, 0L)
+            .apply()
+        val min = waitMs / 60_000L
+        Diag.log("gate", "今日额度复位：连续 $min 分钟没用过 pad，用量和宽限清零，重新给满")
+        // 归在「服务」而不是「密码页」：这条多半是无障碍守护每秒问 gateReason 时触发的，
+        // 跟密码页在不在没关系（密码页那条路由 LockActivity 自己再记一条）
+        Audit.record(Audit.SERVICE, "额度复位", "连续 $min 分钟没用 pad → 今日用量清零、重新给满")
+        return true
+    }
+
+    /**
+     * 宽限里「单次时长」那一半：把 [pkg] 已经用掉的秒数往前挪 [seconds] 秒，
+     * 也就是这次的单次时长顺延这么久（下限 0，不会挪成负数）。
+     *
+     * 2026-09-25 owner：「宽限 10 分钟后，单次时长延长 10 分钟，打开次数不变，全天时长不变」。
+     * 起因是真机上家长刚输完密码，孩子 5 分钟后又被乘法题拦住（那份日志里
+     * 10:02:31 拿宽限、10:07:35 弹题，单次 15 分钟到点）——宽限只加今日额度，
+     * 单次计时照旧在走。单次计时本来就是**按包名各记一份**的，所以只挪孩子当时
+     * 正在用的那一个应用（目标包名由 GuardAccessibilityService 给出，见那边的
+     * grantSessionGrace：它才知道孩子此刻在哪个应用里）。
+     */
+    fun grantSessionGrace(ctx: Context, pkg: String, seconds: Int) {
+        if (seconds <= 0) return
+        val used = sessionUsed(ctx, pkg)
+        setSessionUsed(ctx, pkg, (used - seconds).coerceAtLeast(0))
     }
 
     /**
@@ -342,6 +455,9 @@ object Store {
         // 「系统拦截」关着 = 超时这一类弹框都不弹（家长自己用时最省事）
         if (!sysInterceptOn(ctx)) return null
         rollDate(ctx)
+        // 停够久了先把额度复位，再判超时。放在这儿（而不是只在密码页里）是为了兜住
+        // 「密码页没弹着、人早就走了两小时」那种现场——开机、切回桌面都是从这里问的
+        maybeRefill(ctx)
         val limit = dailyLimitMin(ctx) * 60
         if (limit > 0 && usedSeconds(ctx) >= limit + extraSeconds(ctx)) return "time"
         val ol = openLimit(ctx)
@@ -667,6 +783,7 @@ object Store {
             "openLimit" to openLimit(ctx),
             "usedSeconds" to usedSeconds(ctx),
             "extraSeconds" to extraSeconds(ctx),
+            "refillWaitMin" to refillWaitMin(ctx),
             "openCount" to openCount(ctx),
             "isDefaultLauncher" to isDefaultLauncher(ctx),
             "hasOverlay" to hasOverlay(ctx),
@@ -727,6 +844,7 @@ object Store {
             e.putInt(K_SINGLE_USE_MIN, v)
         }
         (m["graceMin"] as? Number)?.let { e.putInt(K_GRACE_MIN, it.toInt()) }
+        (m["refillWaitMin"] as? Number)?.let { e.putInt(K_REFILL_WAIT_MIN, it.toInt().coerceIn(0, 1440)) }
         (m["openLimit"] as? Number)?.let { e.putInt(K_OPEN_LIMIT, it.toInt()) }
         (m["guardEnabled"] as? Boolean)?.let { e.putBoolean(K_GUARD_ENABLED, it) }
         (m["frontGuard"] as? Boolean)?.let { e.putBoolean(K_FRONT_GUARD, it) }

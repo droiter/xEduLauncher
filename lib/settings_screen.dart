@@ -222,7 +222,12 @@ class _SettingsScreenState extends State<SettingsScreen>
                 SwitchListTile(
                   title: const Text('系统拦截'),
                   subtitle: Text(
-                    !cfg.launchGuard
+                    cfg.launchGuard && !cfg.isDefaultLauncher
+                        ? '已打开，但本应用还不是系统默认桌面：现在整块不生效——密码页、挑战框、'
+                              '任务键那一屏都不动，单次时长也不计时。\n'
+                              '去下面「权限与桌面 → 默认桌面」把它设上即可，这个开关不用动，'
+                              '设上就恢复。'
+                        : !cfg.launchGuard
                         ? '关着：点开应用不答题、从应用退回桌面不答题、时长或次数用满了也不弹密码页，'
                               '孩子按任务键还能看到最近任务。\n'
                               '打开后，下面「挑战设置」「使用限制」里配的东西才开始生效。\n'
@@ -319,7 +324,8 @@ class _SettingsScreenState extends State<SettingsScreen>
                       '答对了重新给满、接着用；答错了把他送回儿童桌面。\n'
                       '离开这个应用（回桌面、切到别的应用）只是暂停计时，剩余时间留着，'
                       '下次进来接着用——按 Home 出去再回来不会重新给满。\n'
-                      '孩子在应用里时，屏幕顶部会有一行小字实时显示这次还剩多久。\n'
+                      '孩子在应用里时，屏幕顶部会有一行小字实时显示还剩多久'
+                      '（单次剩余和今日剩余里较小的那个）。\n'
                       '需要下面「无障碍权限」开着，否则不知道他正在用哪个应用。',
                   value: cfg.singleUseMin,
                   min: 0,
@@ -331,6 +337,10 @@ class _SettingsScreenState extends State<SettingsScreen>
                 ),
                 _sliderTile(
                   title: '输入密码后宽限时间',
+                  subtitle:
+                      '家长在密码页输对密码后：今日时长 + 这么多，并且孩子当时正在用的那个应用'
+                      '单次时长也顺延这么多（打开次数、别的应用的单次时长都不动）。\n'
+                      '桌面标题和屏幕顶部那行小字显示的都是「单次剩余」和「今日剩余」里较小的那个。',
                   value: cfg.graceMin,
                   min: 5,
                   max: 60,
@@ -338,6 +348,21 @@ class _SettingsScreenState extends State<SettingsScreen>
                   label: '${cfg.graceMin} 分钟',
                   onPreview: (v) => _cfg!.graceMin = v,
                   onCommit: (v) => _patch({'graceMin': v}),
+                ),
+                _sliderTile(
+                  title: '用满后复位需要的停用时长',
+                  subtitle:
+                      '今日时长用满后，要连续这么久没碰 pad 才把今日额度清零、重新给满'
+                      '（中间用一下就从头算）。\n'
+                      '密码页对话框下面会显示距离复位还有多久，到点那一页自己关掉，孩子接着玩。\n'
+                      '选「不复位」就只能等第二天，或者家长输密码给宽限。',
+                  value: cfg.refillWaitMin,
+                  min: 0,
+                  max: 360,
+                  divisions: 12,
+                  label: cfg.refillWaitMin == 0 ? '不复位' : '${cfg.refillWaitMin} 分钟',
+                  onPreview: (v) => _cfg!.refillWaitMin = v,
+                  onCommit: (v) => _patch({'refillWaitMin': v}),
                 ),
                 _sliderTile(
                   title: '每日打开次数上限',
@@ -658,6 +683,13 @@ class _SettingsScreenState extends State<SettingsScreen>
     if (!v || !mounted) return;
     final cfg = _cfg;
     if (cfg == null) return;
+    // 不是默认桌面时这一整块都不生效（原生侧按「关着」算）。这一条要排在下面那条前面说，
+    // 否则家长会以为「是我里面哪一项没配」，其实开关打开也没用
+    if (!cfg.isDefaultLauncher) {
+      _toast('系统拦截打开了，但本应用还不是系统默认桌面，现在整块不生效：'
+          '密码页、挑战框、任务键那一屏都不动。去「权限与桌面 → 默认桌面」设上就恢复');
+      return;
+    }
     // 开关打开、下面每一项却都还关着 —— 家长看到的会是「打开了但什么都没拦」，
     // 直接说清楚，省得当成 bug 排查
     if (!cfg.chOnLaunch &&
@@ -681,6 +713,7 @@ class _SettingsScreenState extends State<SettingsScreen>
     _toast(
       v
           ? '开始测试拦截：3 分钟内「系统拦截」和「不让非白名单应用启动」都按打开算，到时自动关掉'
+                '${cfg.isDefaultLauncher ? '' : '。（注意：本应用不是系统默认桌面，这两个开关现在整块都不生效，测试期间也拦不住）'}'
           : '已关掉测试拦截',
     );
   }

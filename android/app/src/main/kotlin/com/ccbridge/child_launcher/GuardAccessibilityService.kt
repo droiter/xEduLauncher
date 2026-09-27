@@ -666,11 +666,13 @@ class GuardAccessibilityService : AccessibilityService() {
      * 那是因为当时默认桌面的判据本身在翻车（[Store.isDefaultLauncher] 会间歇性解析到别人家），
      * 宁可不问。那个 bug 1.0.17 已经修掉（RoleManager 权威判据 → 带 MATCH_DEFAULT_ONLY 的解析
      * → 不带过滤的解析 → 30 秒进程内缓冲），现在问它是安全的。
+     *
+     * 2026-09-26 起「是不是默认桌面」这一问收进了 [Store.sysInterceptOffReason]——owner 说那时候
+     * **整块系统拦截都不该生效**（密码页、挑战框、任务键一起停），不再只是任务键这一条。
      */
     private fun taskKillOffReason(): String? {
-        if (!Store.sysInterceptOn(this)) return "「系统拦截」没打开（也没在测试拦截中）"
+        Store.sysInterceptOffReason(this)?.let { return it }
         if (Store.parentFreeActive(this)) return "家长放行期内（去过系统设置还没回来）"
-        if (!Store.isDefaultLauncher(this)) return "本应用不是系统默认桌面（任务键归那个桌面自己管）"
         return null
     }
 
@@ -1166,6 +1168,37 @@ class GuardAccessibilityService : AccessibilityService() {
         updateOverlay()
     }
 
+    /**
+     * 家长输密码拿到宽限：孩子当时正在用的那个应用，单次时长也顺延 [seconds] 秒
+     * （2026-09-25 owner：「宽限 10 分钟后，单次时长延长 10 分钟」）。
+     *
+     * 目标应用只有这里认得出：**不认 `Store.currentForeground`**（任何窗口事件都会写那个键，
+     * 输入法一弹出来它就成了输入法），而是用 [sessionPkg]／[frontAppPkg]——只认应用窗口。
+     * 会话还活着就直接改现场那份并落盘；会话已经停了（密码页弹出来时可能已经 pause 过）
+     * 就只改落盘的那份，孩子再进来时 [startSession] 读的正是它。
+     *
+     * 返回被顺延的包名；看不出他在用哪个应用（人在桌面上、从没开过应用）时返回 null。
+     */
+    private fun grantSessionGrace(seconds: Int): String? {
+        if (seconds <= 0) return null
+        val pkg = sessionPkg ?: frontAppPkg ?: return null
+        val before = if (sessionPkg == pkg) sessionSeconds else Store.sessionUsed(this, pkg)
+        Store.grantSessionGrace(this, pkg, seconds)
+        if (sessionPkg == pkg) {
+            sessionSeconds = (sessionSeconds - seconds).coerceAtLeast(0)
+            // 顺延之后不该再卡在「一进来就弹题」那个状态上：把表接着走起来
+            arm()
+            updateOverlay()
+        }
+        val after = if (sessionPkg == pkg) sessionSeconds else Store.sessionUsed(this, pkg)
+        Diag.log(
+            "session",
+            "家长宽限：$pkg 的单次已用 ${before}s → ${after}s（顺延 ${seconds}s）",
+        )
+        Audit.record(Audit.LOCK, pkg, "宽限顺延单次时长 ${seconds / 60} 分钟（$pkg）")
+        return pkg
+    }
+
     /** 只在有会话、且家长没把上限设成「不限」时走表 */
     private fun arm() {
         handler.removeCallbacks(sessionTick)
@@ -1357,7 +1390,38 @@ class GuardAccessibilityService : AccessibilityService() {
         if (tv.visibility != View.VISIBLE) tv.visibility = View.VISIBLE
     }
 
-    /** 这行小字该显示什么；null = 不显示（没开单次上限 / 没在会话里 / 家长放行中 / 本应用的页面压在上面） */
+    /** 今日还剩多少秒（没设今日上限时 null）。和 [Store.gateReason] 用的同一个算式 */
+    private fun dailyLeftSec(): Int? {
+        val limit = Store.dailyLimitMin(this)
+        if (limit <= 0) return null
+        return (limit * 60 + Store.extraSeconds(this) - Store.usedSeconds(this)).coerceAtLeast(0)
+    }
+
+    /**
+     * 孩子刚在用的那个应用的单次还剩多少秒；没设单次上限、或者还看不出他在用哪个应用时返回 null。
+     *
+     * 目标是 [sessionPkg]（孩子在应用里时），它为空时退回 [frontAppPkg]——孩子已经回到桌面
+     * 但还要看「他刚才那个应用还剩多久」。两条都用不着 [Store.currentForeground]：
+     * 那个键任何窗口事件都会写（输入法、状态栏都算），见 [tickSession] 里那段。
+     */
+    private fun sessionLeftSec(): Int? {
+        val limit = Store.singleUseMin(this)
+        if (limit <= 0) return null
+        val pkg = sessionPkg ?: frontAppPkg ?: return null
+        val used = if (sessionPkg == pkg) sessionSeconds else Store.sessionUsed(this, pkg)
+        return (limit * 60 - used).coerceAtLeast(0)
+    }
+
+    private fun fmtLeft(sec: Int) = "${sec / 60}:${(sec % 60).toString().padStart(2, '0')}"
+
+    /**
+     * 这行小字该显示什么；null = 不显示（没开单次上限 / 没在会话里 / 家长放行中 / 本应用的页面压在上面）。
+     *
+     * **显示的是「单次剩余」和「今日剩余」里较小的那个**（2026-09-25 owner：
+     * 「桌面提示时间为 min（单次剩余时间，全体剩余时间）」）。以前只报单次剩余，
+     * 于是出现「顶部小字写着还有几分钟、超时却弹『今日时长用完』」这种看着自相矛盾的现场
+     * （2026-09-25 12:38 那份自检报告）。现在谁先到点就报谁，并且把是哪一种写在前面。
+     */
     private fun overlayText(): String? {
         val limit = Store.singleUseMin(this)
         if (limit <= 0) return null
@@ -1368,7 +1432,9 @@ class GuardAccessibilityService : AccessibilityService() {
             return null
         }
         val left = (limit * 60 - sessionSeconds).coerceAtLeast(0)
-        return "本次剩余 ${left / 60}:${(left % 60).toString().padStart(2, '0')}"
+        val daily = dailyLeftSec()
+        return if (daily != null && daily < left) "今日剩余 ${fmtLeft(daily)}"
+        else "本次剩余 ${fmtLeft(left)}"
     }
 
     /** 这个窗口 id 是不是本服务自己加的浮层 */
@@ -1577,6 +1643,15 @@ class GuardAccessibilityService : AccessibilityService() {
             instance?.answerChallenge(ok)
         }
 
+        /**
+         * 家长输密码拿到宽限：孩子当时在用的那个应用，单次时长顺延 [seconds] 秒。
+         * 服务没在跑时返回 null（那时也就没有单次计时可言）。
+         */
+        fun grantSessionGrace(seconds: Int): String? = instance?.grantSessionGrace(seconds)
+
+        /** 桌面顶部要显示的「单次剩余」：孩子刚在用的那个应用还剩多少秒。看不出时 null */
+        fun sessionLeftSec(): Int? = instance?.sessionLeftSec()
+
         /** 桌面回到前台：孩子已经离开了刚才那个应用，这一轮的表停在这里（剩余留着） */
         fun onDesktopShown() {
             instance?.let {
@@ -1778,6 +1853,33 @@ class GuardAccessibilityService : AccessibilityService() {
             val limit = Store.singleUseMin(ctx)
             val sb = StringBuilder()
             sb.appendLine("上限设置：${if (limit <= 0) "不限（功能关着）" else "$limit 分钟"}")
+            // 2026-09-22 那份「输一次密码却连弹两个密码框」的报告只能靠日志时间线反推，
+            // 就是因为这三个数没打印（第 48 条留的「下次动这块顺手加上」）
+            val dLimit = Store.dailyLimitMin(ctx) * 60
+            val dLeft = if (dLimit > 0) {
+                (dLimit + Store.extraSeconds(ctx) - Store.usedSeconds(ctx)).coerceAtLeast(0)
+            } else null
+            sb.appendLine(
+                "今日额度：上限 ${Store.dailyLimitMin(ctx)} 分钟、宽限累计 ${Store.extraSeconds(ctx) / 60} 分钟、" +
+                    "已用 ${Store.usedSeconds(ctx)} 秒" +
+                    (if (dLeft != null) "，还剩 ${dLeft / 60}:${(dLeft % 60).toString().padStart(2, '0')}" else "（今日不限）")
+            )
+            sb.appendLine(
+                "家长宽限 = 今日时长 +${Store.graceMin(ctx)} 分钟 ＋ 孩子当时在用的那个应用单次时长顺延 " +
+                    "${Store.graceMin(ctx)} 分钟（打开次数、别的应用的单次时长都不动）"
+            )
+            sb.appendLine("顶部小字/桌面标题显示的是「单次剩余」和「今日剩余」里较小的那个")
+            val rWait = Store.refillWaitMin(ctx)
+            val rLeft = Store.refillLeftSec(ctx)
+            sb.appendLine(
+                "额度复位：" +
+                    if (rWait <= 0) "关着（用满就只能等第二天或家长给宽限）"
+                    else "用满后连续停用 $rWait 分钟自动复位" + when {
+                        rLeft != null -> "；现在正等着，还剩 ${rLeft / 60}:${(rLeft % 60).toString().padStart(2, '0')}"
+                        Store.dailyExhausted(ctx) -> "；已经用满了，但还没有停用起点（过一秒就会开始数）"
+                        else -> "；当前没用满，不在等"
+                    }
+            )
             val s = instance
             if (s == null) {
                 sb.appendLine("当前会话：无障碍服务没在运行，不会计时")
@@ -1785,9 +1887,11 @@ class GuardAccessibilityService : AccessibilityService() {
                 sb.appendLine("屏幕顶部剩余时间小字：不会出现（它由无障碍服务显示）")
                 return sb.toString()
             }
-            if (!Store.sysInterceptOn(ctx)) {
-                sb.appendLine("当前会话：（不会计时——「系统拦截」关着，超时的乘法题不弹）")
-                sb.appendLine("  → 要限时就在「家长设置 → 拦截」里打开「系统拦截」，或开一次「测试拦截」")
+            val sysOff = Store.sysInterceptOffReason(ctx)
+            if (sysOff != null) {
+                sb.appendLine("当前会话：（不会计时——$sysOff，超时的乘法题不弹）")
+                sb.appendLine("  → 要限时就在「家长设置 → 拦截」里打开「系统拦截」，或开一次「测试拦截」；")
+                sb.appendLine("    不是默认桌面的话，先去「权限与桌面 → 默认桌面」把它设上（开关不用动）")
                 sb.appendLine("屏幕顶部剩余时间小字：不会出现（没有会话就没有这行小字）")
                 return sb.toString()
             }

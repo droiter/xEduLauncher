@@ -29,6 +29,10 @@ class LauncherConfig {
   int singleUseMin;
   int graceMin;
   int openLimit;
+
+  /// 今日额度用满后，要「连续停用」这么多分钟才自动复位（缺省 120＝2 小时，0 = 不复位）。
+  /// 「连续」是认真的：中间碰一下 pad（计时又走了一秒）就从头算
+  int refillWaitMin;
   int usedSeconds;
   int extraSeconds;
   int openCount;
@@ -41,7 +45,10 @@ class LauncherConfig {
   bool frontGuard;
 
   /// 「系统拦截」。**缺省关着**：关着时点开应用、从应用回桌面、超时（时长/次数用满）
-  /// 这些框一个都不弹，任务键也能看到最近任务
+  /// 这些框一个都不弹，任务键也能看到最近任务。
+  ///
+  /// 另外：本应用**不是系统默认桌面**时，这一整块也按关着算（密码页、挑战框、任务键都不动，
+  /// 单次时长也不计时）——开关本身的值不变，设成默认桌面就恢复。见原生 `Store.sysInterceptOffReason`
   bool launchGuard;
 
   /// 「测试拦截」还剩多少秒（0 = 没在测试）。测试期间两个开关都按打开算，到时自动关
@@ -67,6 +74,13 @@ class LauncherConfig {
   /// 本次进程是否因「按 Home 键」而启动
   bool coldStartHome;
 
+  /// 孩子刚在用的那个应用单次还剩多少秒（`singleUseMin` 设成不限、或者还看不出他在用哪个应用
+  /// 时是 null）。原生侧现算，不在 `Store.configMap` 里——那份 map 会被逐项比对出「配置变更」。
+  ///
+  /// 桌面标题和屏幕顶部那行小字显示的都是 min(它, 今日剩余)：谁先到点就报谁，
+  /// 免得出现「上面还写着有几分钟、超时却弹今天用完了」这种看着自相矛盾的现场。
+  int? sessionLeftSeconds;
+
   LauncherConfig({
     this.password = '123456',
     this.settingsPassword = '123456',
@@ -82,6 +96,7 @@ class LauncherConfig {
     this.singleUseMin = 10,
     this.graceMin = 10,
     this.openLimit = 0,
+    this.refillWaitMin = 120,
     this.usedSeconds = 0,
     this.extraSeconds = 0,
     this.openCount = 0,
@@ -97,6 +112,7 @@ class LauncherConfig {
     this.fileServerOn = false,
     this.fileServerUrl = '',
     this.coldStartHome = false,
+    this.sessionLeftSeconds,
   });
 
   factory LauncherConfig.fromMap(Map<dynamic, dynamic> m) => LauncherConfig(
@@ -114,6 +130,7 @@ class LauncherConfig {
     singleUseMin: (m['singleUseMin'] as num?)?.toInt() ?? 10,
     graceMin: (m['graceMin'] as num?)?.toInt() ?? 10,
     openLimit: (m['openLimit'] as num?)?.toInt() ?? 0,
+    refillWaitMin: (m['refillWaitMin'] as num?)?.toInt() ?? 120,
     usedSeconds: (m['usedSeconds'] as num?)?.toInt() ?? 0,
     extraSeconds: (m['extraSeconds'] as num?)?.toInt() ?? 0,
     openCount: (m['openCount'] as num?)?.toInt() ?? 0,
@@ -129,6 +146,7 @@ class LauncherConfig {
     fileServerOn: m['fileServerOn'] as bool? ?? false,
     fileServerUrl: m['fileServerUrl'] as String? ?? '',
     coldStartHome: m['coldStartHome'] as bool? ?? false,
+    sessionLeftSeconds: (m['sessionLeftSec'] as num?)?.toInt(),
   );
 
   /// 这个应用点开时要弹挑战吗（挑战总开关关掉时一律不弹）

@@ -63,4 +63,17 @@
         android:gravity="center"
         android:textColor="#FFFF7A7A"
         android:textSize="14sp" />
+
+    <!-- 「今天还能不能接着玩、还要等多久」：只在 reason=time 且设了今日上限时出现，
+         每秒跟着走，到点这一页自己关掉（见 LockActivity.tickRefill） -->
+    <TextView
+        android:id="@+id/lockRefill"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="18dp"
+        android:gravity="center"
+        android:lineSpacingExtra="4dp"
+        android:textColor="#FF9AE6B4"
+        android:textSize="15sp"
+        android:visibility="gone" />
 </LinearLayout>

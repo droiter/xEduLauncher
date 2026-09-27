@@ -207,10 +207,11 @@ class MainActivity : FlutterActivity() {
         val viaHome = viaHomeIntent
 
         val verdict = when {
-            // 「系统拦截」关着（家长自己用平板，或者「测试拦截」到点了）：从应用回桌面不弹挑战，
-            // 孩子按 Home / 按返回键退出应用都直接进桌面。这一条排在最前面——
-            // 它是这一层拦截生不生效的总判据，其它证据再结实也轮不上
-            !Store.sysInterceptOn(this) -> false to "「系统拦截」关着（也没在测试拦截中），不拦"
+            // 「系统拦截」没生效（家长自己用平板、「测试拦截」到点了、或者本应用不是默认桌面）：
+            // 从应用回桌面不弹挑战，孩子按 Home / 按返回键退出应用都直接进桌面。这一条排在最前面
+            // ——它是这一层拦截生不生效的总判据，其它证据再结实也轮不上
+            !Store.sysInterceptOn(this) ->
+                false to "${Store.sysInterceptOffReason(this) ?: "「系统拦截」没生效"}，不拦"
             // 守护自己刚把他弹回来的那次（孩子开了非白名单应用）不算他按的 Home，拦回桌面就完事
             Store.guardBounceRecent(this) -> false to "守护刚把他弹回桌面"
             // 「最近任务」那一屏刚露过头（按任务键带出来的）。那一屏会把桌面顶成 onStop/onPause，
@@ -376,7 +377,10 @@ class MainActivity : FlutterActivity() {
         if (nowDefault != lastDefault) {
             Diag.log(
                 "home",
-                "默认桌面状态 ${lastDefault ?: "（首次）"} → $nowDefault，当前系统桌面=${defaultLauncherLabel()}",
+                "默认桌面状态 ${lastDefault ?: "（首次）"} → $nowDefault，当前系统桌面=${defaultLauncherLabel()}" +
+                    // 这一句是给「超时怎么不弹了」留的线索：不是开关被关了，是整块按关着算
+                    (if (nowDefault) "（系统拦截恢复按它自己的开关算）"
+                    else "（系统拦截整块停：不弹密码页、不弹挑战框、任务键那一屏也不退）"),
             )
             lastDefault = nowDefault
         }
@@ -525,6 +529,11 @@ class MainActivity : FlutterActivity() {
                 val home = pendingHome
                 pendingHome = null
                 m["coldStartHome"] = home?.first == true
+                // 桌面顶部那行「还剩多久」要看「单次剩余」和「今日剩余」里较小的那个，
+                // 单次那一半只有无障碍服务认得（它知道孩子刚在用的是哪个应用）。
+                // **故意不放进 Store.configMap**：那份 map 被 logConfigChange 逐项比对，
+                // 塞一个每秒都在变的动态值进去，改配置的日志里会满屏假变更
+                GuardAccessibilityService.sessionLeftSec()?.let { m["sessionLeftSec"] = it }
                 result.success(m)
             }
             @Suppress("UNCHECKED_CAST")
@@ -995,9 +1004,10 @@ class MainActivity : FlutterActivity() {
         sb.appendLine(
             "「测试拦截」：" + if (left > 0) "进行中，还剩 ${left}s（到时自动关，两个都按打开算）" else "没在测试"
         )
+        val sysOff = Store.sysInterceptOffReason(this)
         sb.appendLine(
-            "⇒ 系统拦截" + if (Store.sysInterceptOn(this)) "生 效（点开应用/回桌面答题、超时弹框、任务列表照管）"
-            else "不生效（不弹挑战、不弹密码页、任务列表不挡）"
+            "⇒ 系统拦截" + if (sysOff == null) "生 效（点开应用/回桌面答题、超时弹框、任务列表照管）"
+            else "不生效（不弹挑战、不弹密码页、任务列表不挡）：$sysOff"
         )
         sb.appendLine("「按任务键退掉最近任务」那一屏：${GuardAccessibilityService.taskKillStateText(this)}")
         sb.appendLine()

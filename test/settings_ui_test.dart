@@ -26,6 +26,7 @@ Map<String, Object?> _config({
   'dailyLimitMin': 30,
   'singleUseMin': 5,
   'graceMin': 10,
+  'refillWaitMin': 120,
   'openLimit': 0,
   'usedSeconds': 60,
   'extraSeconds': 0,
@@ -112,6 +113,20 @@ void main() {
     expect(find.textContaining('缺省是关的'), findsNWidgets(2));
   });
 
+  testWidgets('系统拦截开着、但不是默认桌面：写明整块不生效，开关本身照旧显示打开', (tester) async {
+    _mock(() => {..._config(), 'launchGuard': true, 'isDefaultLauncher': false});
+    useTallScreen(tester);
+    await tester.pumpWidget(const MaterialApp(home: SettingsScreen()));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('还不是系统默认桌面：现在整块不生效'), findsOneWidget);
+    // 开关的值不动：设成默认桌面就恢复，家长不用回来重新打开
+    final sw = tester.widget<SwitchListTile>(
+      find.widgetWithText(SwitchListTile, '系统拦截'),
+    );
+    expect(sw.value, isTrue);
+  });
+
   testWidgets('只开「不让非白名单应用启动」时不说「等于没拦」（两开关独立）', (tester) async {
     _mock(() => {..._config(), 'frontGuard': true});
     useTallScreen(tester);
@@ -188,6 +203,28 @@ void main() {
     expect(find.text('5 分钟'), findsOneWidget);
     expect(find.textContaining('答错了把他送回儿童桌面'), findsOneWidget);
     expect(find.textContaining('只是暂停计时，剩余时间留着'), findsOneWidget);
+  });
+
+  testWidgets('用满后复位需要的停用时长：缺省 2 小时，写明「连续停用」和「到点自己关掉」', (tester) async {
+    _mock(_config);
+    useTallScreen(tester);
+    await tester.pumpWidget(const MaterialApp(home: SettingsScreen()));
+    await tester.pumpAndSettle();
+
+    expect(find.text('用满后复位需要的停用时长'), findsOneWidget);
+    expect(find.text('120 分钟'), findsOneWidget);
+    expect(find.textContaining('要连续这么久没碰 pad'), findsOneWidget);
+    expect(find.textContaining('距离复位还有多久'), findsOneWidget);
+  });
+
+  testWidgets('复位停用时长可以设成「不复位」', (tester) async {
+    _mock(() => {..._config(), 'refillWaitMin': 0});
+    useTallScreen(tester);
+    await tester.pumpWidget(const MaterialApp(home: SettingsScreen()));
+    await tester.pumpAndSettle();
+
+    expect(find.text('不复位'), findsOneWidget);
+    expect(find.textContaining('只能等第二天'), findsOneWidget);
   });
 
   testWidgets('单次使用时长上限可以设成「不限」', (tester) async {
