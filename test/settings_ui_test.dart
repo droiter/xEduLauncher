@@ -43,7 +43,11 @@ Map<String, Object?> _config({
   'fileServerUrl': '',
 };
 
-void _mock(Map<String, Object?> Function() config, {List<String>? calls}) {
+void _mock(
+  Map<String, Object?> Function() config, {
+  List<String>? calls,
+  bool withVersion = true,
+}) {
   TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
       .setMockMethodCallHandler(_channel, (call) async {
         // 打开应用这类要核对参数的调用连参数一起记下来
@@ -53,6 +57,15 @@ void _mock(Map<String, Object?> Function() config, {List<String>? calls}) {
               : call.method,
         );
         switch (call.method) {
+          case 'appVersion':
+            return withVersion
+                ? {
+                    'name': '儿童桌面',
+                    'version': '1.0.44',
+                    'build': 45,
+                    'package': 'com.ccbridge.child_launcher',
+                  }
+                : null;
           case 'config':
             return config();
           case 'defaultLauncherName':
@@ -97,6 +110,31 @@ void main() {
     expect(find.text('修改家长控制密码'), findsOneWidget);
     expect(find.text('修改系统设置密码'), findsOneWidget);
     expect(find.textContaining('未单独设置，目前沿用家长控制密码'), findsOneWidget);
+  });
+
+  testWidgets('「关于」显示当前版本，点开是完整版本信息', (tester) async {
+    _mock(_config);
+    useTallScreen(tester);
+    await tester.pumpWidget(const MaterialApp(home: SettingsScreen()));
+    await tester.pumpAndSettle();
+
+    // 家长要拿这个号来对「我装的是哪一版」，所以不点开也得看得见
+    expect(find.text('关于'), findsOneWidget);
+    expect(find.text('1.0.44（构建 45）'), findsOneWidget);
+
+    await tester.tap(find.text('1.0.44（构建 45）'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('版本 1.0.44（构建 45）'), findsOneWidget);
+    expect(find.textContaining('包名 com.ccbridge.child_launcher'), findsOneWidget);
+  });
+
+  testWidgets('原生侧答不上版本时写「没取到」，不编一个号出来', (tester) async {
+    _mock(_config, withVersion: false);
+    useTallScreen(tester);
+    await tester.pumpWidget(const MaterialApp(home: SettingsScreen()));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('版本信息没取到'), findsOneWidget);
   });
 
   testWidgets('拦截是两个互相独立的开关，缺省都关着', (tester) async {

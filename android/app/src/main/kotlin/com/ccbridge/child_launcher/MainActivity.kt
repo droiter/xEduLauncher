@@ -6,6 +6,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
 import android.graphics.Bitmap
@@ -640,6 +641,7 @@ class MainActivity : FlutterActivity() {
                 result.success(true)
             }
             "defaultLauncherName" -> result.success(defaultLauncherLabel())
+            "appVersion" -> result.success(appVersion())
             else -> result.notImplemented()
         }
     }
@@ -1096,6 +1098,27 @@ class MainActivity : FlutterActivity() {
 
     private fun defaultLauncherLabel(): String =
         resolve(homeIntent())?.loadLabel(packageManager)?.toString() ?: "未知"
+
+    /**
+     * 「关于」里显示的版本信息：全取自 PackageManager，不跟 pubspec 里那份对，
+     * 家长装的到底是哪一版由这里说了算。
+     */
+    private fun appVersion(): Map<String, Any> {
+        val pi = try {
+            packageManager.getPackageInfo(packageName, 0)
+        } catch (_: Exception) {
+            null
+        }
+        return mapOf(
+            "name" to getString(R.string.app_name),
+            "version" to (pi?.versionName ?: "?"),
+            "build" to versionCodeOf(pi),
+            "package" to packageName,
+        )
+    }
+
+    @Suppress("DEPRECATION")
+    private fun versionCodeOf(pi: PackageInfo?): Int = pi?.versionCode ?: 0
 
     companion object {
         const val CHANNEL = "child_launcher/native"

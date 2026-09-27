@@ -75,6 +75,34 @@ class AccessibilityStatus {
   bool get ok => enabled && running;
 }
 
+/// 「关于」里显示的版本信息。一律现问原生侧（PackageManager），
+/// 不在 Dart 里写死一份——写死的那份迟早和 pubspec / 构建产物对不上。
+class AppVersion {
+  final String name;
+  final String version;
+
+  /// versionCode，构建号
+  final int build;
+  final String package;
+
+  const AppVersion({
+    required this.name,
+    required this.version,
+    required this.build,
+    required this.package,
+  });
+
+  factory AppVersion.fromMap(Map<dynamic, dynamic> m) => AppVersion(
+    name: m['name'] as String? ?? '儿童桌面',
+    version: m['version'] as String? ?? '?',
+    build: (m['build'] as num?)?.toInt() ?? 0,
+    package: m['package'] as String? ?? '',
+  );
+
+  /// 「1.0.44（构建 45）」
+  String get label => '$version（构建 $build）';
+}
+
 /// 与 Android 原生侧的 MethodChannel 封装。
 /// iOS / 鸿蒙若要适配，只需在此层替换实现，UI 层不受影响。
 class Native {
@@ -221,6 +249,18 @@ class Native {
   static Future<int> clearDiagLogs() async =>
       await _ch.invokeMethod<int>('launcherDiagClear') ?? 0;
 
+
+  /// 当前版本（家长设置 → 关于）。原生侧答不上来时返回 null，界面上显示「取不到」，
+  /// 不编一个版本号出来——家长拿这个号来对「我装的是哪一版」，编错了比没有更糟
+  static Future<AppVersion?> appVersion() async {
+    try {
+      final raw = await _ch.invokeMethod<Map<dynamic, dynamic>>('appVersion');
+      if (raw == null) return null;
+      return AppVersion.fromMap(raw);
+    } catch (_) {
+      return null;
+    }
+  }
 
   static Future<void> openSystemSettings() => _ch.invokeMethod('openSystemSettings');
 
