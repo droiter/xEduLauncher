@@ -19,6 +19,9 @@ class _SettingsScreenState extends State<SettingsScreen>
   LauncherConfig? _cfg;
   String _defaultLauncher = '';
 
+  /// 「关于」里那份版本信息；原生侧没答上来时留着 null，界面上写「取不到」
+  AppVersion? _appVersion;
+
   /// 「测试拦截」还剩多少秒。真相在原生侧（按到期时刻算），这里只是为了让它每秒往下走
   int _testLeft = 0;
   Timer? _testTimer;
@@ -56,10 +59,12 @@ class _SettingsScreenState extends State<SettingsScreen>
   Future<void> _load() async {
     final cfg = await Native.config();
     final name = await Native.defaultLauncherName();
+    final version = await Native.appVersion();
     if (!mounted) return;
     setState(() {
       _cfg = cfg;
       _defaultLauncher = name;
+      _appVersion = version;
       _testLeft = cfg.testGuardLeftSec;
     });
     _syncTestTimer();
@@ -120,6 +125,22 @@ class _SettingsScreenState extends State<SettingsScreen>
       body: report,
       onCopy: () async => Clipboard.setData(ClipboardData(text: report)),
       onClear: _clearDiagLogs,
+    );
+  }
+
+  /// 「关于」：这一版到底是哪一版——家长总得有个准数，报问题时要拿它来说话
+  Future<void> _showAbout() async {
+    final v = _appVersion;
+    if (v == null) {
+      _toast('版本信息没取到，重开一次这一页再看');
+      return;
+    }
+    await _showCopyableDialog(
+      title: '关于',
+      body: '${v.name}\n版本 ${v.label}\n包名 ${v.package}',
+      onCopy: () async => Clipboard.setData(
+        ClipboardData(text: '${v.name} ${v.version}（构建 ${v.build}）'),
+      ),
     );
   }
 
@@ -560,6 +581,19 @@ class _SettingsScreenState extends State<SettingsScreen>
                       ),
                     ],
                   ),
+                ),
+
+                _section('关于'),
+                ListTile(
+                  // 当前位置写的是「关于」，条目上写应用名，家长点开就是完整版本信息
+                  title: Text(_appVersion?.name ?? '儿童桌面'),
+                  subtitle: Text(
+                    _appVersion == null
+                        ? '版本信息没取到，重开一次这一页再看'
+                        : _appVersion!.label,
+                  ),
+                  trailing: const Icon(Icons.chevron_right),
+                  onTap: _showAbout,
                 ),
               ],
             ),
